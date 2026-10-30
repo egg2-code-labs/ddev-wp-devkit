@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+#ddev-generated
+"$(dirname "$0")/_dbsync" pull || true

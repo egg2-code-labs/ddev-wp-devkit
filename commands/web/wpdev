@@ -1,0 +1,352 @@
+#!/usr/bin/env bash
+#ddev-generated
+## Description: WordPress local dev helpers (setup, prepare imported DB, local admin, status)
+## Usage: wpdev [setup|prepare|admin|status] [args]
+## Example: "ddev wpdev status"\n"ddev wpdev prepare"\n"ddev wpdev admin"\n"ddev wpdev admin myuser mypass"
+## ProjectTypes: wordpress
+
+set -euo pipefail
+
+DOCROOT="/var/www/html/${DDEV_DOCROOT:-}"
+DOCROOT="${DOCROOT%/}"
+DEVKIT_DIR="/var/www/html/.ddev/wp-devkit"
+WPCONFIG="${DOCROOT}/wp-config.php"
+NEW_URL="${DDEV_PRIMARY_URL%/}"
+
+info() { echo "wpdev: $*"; }
+warn() { echo "wpdev: WARNING: $*" >&2; }
+die() { echo "wpdev: ERROR: $*" >&2; exit 1; }
+
+sql() { mysql -N -B -e "$1"; }
+sql_escape() { printf '%s' "$1" | sed "s/'/''/g"; }
+table_exists() { [ -n "$(sql "SHOW TABLES LIKE '$(sql_escape "$1")'")" ]; }
+
+# WP-CLI without plugins/themes: works even when the DB still points to another domain.
+wp() { command wp --path="${DOCROOT}" "$@"; }
+wpcli() { wp --skip-plugins --skip-themes --url="${NEW_URL}" "$@"; }
+
+detect_prefix() {
+  if [ -n "${WPDEV_TABLE_PREFIX:-}" ]; then
+    echo "${WPDEV_TABLE_PREFIX}"
+    return
+  fi
+  # Shortest "*options" table that contains a siteurl row.
+  local t
+  for t in $(sql "SHOW TABLES LIKE '%options'" | awk '{ print length, $0 }' | sort -n | cut -d' ' -f2-); do
+    if [ -n "$(sql "SELECT 1 FROM \`${t}\` WHERE option_name='siteurl' LIMIT 1" 2>/dev/null)" ]; then
+      echo "${t%options}"
+      return
+    fi
+  done
+  echo "wp_"
+}
+
+# Prints "scheme host path" for a URL; path without trailing slash ("" for root).
+parse_url() {
+  php -r '$u = parse_url($argv[1]); $h = $u["host"] . (isset($u["port"]) ? ":" . $u["port"] : ""); echo ($u["scheme"] ?? "https") . " " . $h . " " . rtrim($u["path"] ?? "", "/");' "$1"
+}
+
+cmd_setup() {
+  local quiet="${1:-}"
+  if [ -f "${WPCONFIG}" ] && ! grep -q '#ddev-generated' "${WPCONFIG}"; then
+    if grep -q '#wpdev-generated' "${WPCONFIG}"; then
+      [ "${quiet}" = "--quiet" ] || info "wp-config.php is managed by wp-devkit."
+    else
+      grep -q 'wp-config-devkit.php' "${WPCONFIG}" || warn "Custom wp-config.php found. Add this line before wp-config-ddev.php is loaded:
+  if ( getenv( 'IS_DDEV_PROJECT' ) === 'true' ) { require '${DEVKIT_DIR}/wp-config-devkit.php'; }"
+    fi
+    return 0
+  fi
+
+  local salts
+  salts="$(php -r '
+    foreach (["AUTH_KEY","SECURE_AUTH_KEY","LOGGED_IN_KEY","NONCE_KEY","AUTH_SALT","SECURE_AUTH_SALT","LOGGED_IN_SALT","NONCE_SALT"] as $k) {
+      printf("define( %s, %s );\n", var_export($k, true), var_export(bin2hex(random_bytes(32)), true));
+    }')"
+  php -r 'echo str_replace("__SALTS__", rtrim($argv[2]), file_get_contents($argv[1]));' \
+    "${DEVKIT_DIR}/wp-config.php.tpl" "${salts}" > "${WPCONFIG}"
+  info "Created ${WPCONFIG#/var/www/html/} (local only, keep it out of git)."
+}
+
+cmd_prepare() {
+  local p
+  p="$(detect_prefix)"
+  table_exists "${p}options" || die "No WordPress tables found (prefix '${p}'). Import a database first."
+  if [ -z "${WPDEV_TABLE_PREFIX:-}" ] && [ "${p}" != "wp_" ]; then
+    warn "Table prefix is '${p}'. Set WPDEV_TABLE_PREFIX=${p} in .ddev/.env and run 'ddev restart'."
+  fi
+
+  local multisite=""
+  if table_exists "${p}blogs"; then
+    multisite="yes"
+    if [ -z "${WPDEV_MULTISITE:-}" ]; then
+      local hosts
+      hosts="$(sql "SELECT COUNT(DISTINCT domain) FROM \`${p}blogs\`")"
+      local guess="subdirectory"
+      [ "${hosts}" -gt 1 ] && guess="subdomain"
+      die "Database is a multisite network. Set WPDEV_MULTISITE=${guess} in .ddev/.env, run 'ddev restart', then 'ddev wpdev prepare'."
+    fi
+  fi
+
+  local old_url
+  old_url="$(sql "SELECT option_value FROM \`${p}options\` WHERE option_name='home' LIMIT 1")"
+  old_url="${old_url%/}"
+  [ -n "${old_url}" ] || die "Could not read 'home' from ${p}options."
+
+  read -r old_scheme old_host old_path <<< "$(parse_url "${old_url}")"
+  read -r new_scheme new_host new_path <<< "$(parse_url "${NEW_URL}")"
+
+  if [ "${old_host}${old_path}" = "${new_host}${new_path}" ]; then
+    info "URLs already point to ${NEW_URL}, no rewrite needed."
+  else
+    info "Rewriting ${old_url} -> ${NEW_URL}"
+
+    if [ -n "${multisite}" ]; then
+      local oh nh op
+      oh="$(sql_escape "${old_host}")"; nh="$(sql_escape "${new_host}")"; op="$(sql_escape "${old_path}")"
+      sql "UPDATE \`${p}site\` SET domain='${nh}', path='/';
+           UPDATE \`${p}blogs\` SET domain=REPLACE(domain, '${oh}', '${nh}'),
+                  path=CONCAT('/', SUBSTRING(path, CHAR_LENGTH('${op}/') + 1))
+            WHERE path LIKE '${op}/%';
+           UPDATE \`${p}sitemeta\` SET meta_value='$(sql_escape "${NEW_URL}")/' WHERE meta_key='siteurl';"
+      info "Updated ${p}site, ${p}blogs, ${p}sitemeta."
+    fi
+
+    local skip="${WPDEV_SR_SKIP_TABLES:-*statistics*,*wfhits,*wffilemods,*wfknownfilelist,*wflivetraffichuman,*itsec_logs,*actionscheduler_logs}"
+    local -a pairs=(
+      "//www.${old_host}${old_path}" "//${new_host}"
+      "//${old_host}${old_path}" "//${new_host}"
+      "\\/\\/www.${old_host}${old_path//\//\\/}" "\\/\\/${new_host}"
+      "\\/\\/${old_host}${old_path//\//\\/}" "\\/\\/${new_host}"
+      "%2F%2Fwww.${old_host}${old_path//\//%2F}" "%2F%2F${new_host}"
+      "%2F%2F${old_host}${old_path//\//%2F}" "%2F%2F${new_host}"
+    )
+    if [ "${new_scheme}" = "https" ]; then
+      pairs+=( "http://${new_host}" "https://${new_host}" "http:\\/\\/${new_host}" "https:\\/\\/${new_host}" "http%3A%2F%2F${new_host}" "https%3A%2F%2F${new_host}" )
+    fi
+
+    local i
+    for (( i = 0; i < ${#pairs[@]}; i += 2 )); do
+      info "  ${pairs[i]}  ->  ${pairs[i+1]}"
+      wpcli search-replace "${pairs[i]}" "${pairs[i+1]}" \
+        --all-tables --skip-columns=guid --skip-tables="${skip}" \
+        --report-changed-only --format=count >/dev/null
+    done
+  fi
+
+  wpcli cache flush >/dev/null 2>&1 || true
+
+  if [ "${WPDEV_ADMIN_AUTO:-false}" = "true" ]; then
+    cmd_admin --if-missing
+  fi
+
+  info "Done. Site: ${NEW_URL}"
+  [ -n "${multisite}" ] && wpcli site list --field=url | sed 's/^/wpdev:   /' || true
+  return 0
+}
+
+cmd_admin() {
+  local if_missing=""
+  if [ "${1:-}" = "--if-missing" ]; then if_missing="yes"; shift; fi
+  local user="${1:-${WPDEV_ADMIN_USER:-devadmin}}"
+  local pass="${2:-${WPDEV_ADMIN_PASSWORD:-devadmin}}"
+  local email="${WPDEV_ADMIN_EMAIL:-${user}@example.test}"
+
+  if wpcli user get "${user}" --field=ID >/dev/null 2>&1; then
+    if [ -n "${if_missing}" ]; then
+      info "Administrator '${user}' already exists."
+      return 0
+    fi
+    wpcli user update "${user}" --user_pass="${pass}" --skip-email >/dev/null
+    info "Password of existing user '${user}' reset (local database only)."
+  else
+    wpcli user create "${user}" "${email}" --role=administrator --user_pass="${pass}" >/dev/null
+    info "Created administrator '${user}'."
+  fi
+  if wpcli core is-installed --network >/dev/null 2>&1; then
+    wpcli super-admin add "${user}" >/dev/null
+    info "'${user}' is super admin of the network."
+  fi
+  info "Login: ${NEW_URL}/wp-login.php"
+}
+
+# Content hash of the database, ignoring data that changes without anyone editing
+# content (transients, cron, sessions, edit locks, logs, statistics, caches).
+cmd_hash() {
+  local verbose="${1:-}"
+  local p
+  p="$(detect_prefix)"
+  table_exists "${p}options" || { echo "empty"; return 0; }
+
+  local skip_re="${WPDEV_DB_HASH_SKIP_TABLES:-statistics|_wf|itsec_|actionscheduler_|yoast_indexable|yoast_seo_links|_sessions|icl_url_resolution_cache|icl_string_positions|cli_cookie_scan|tec_kv_cache|us_filter_index}"
+  local opt_skip="${WPDEV_DB_HASH_SKIP_OPTIONS:-^(_site)?_transient_|^cron$|^rewrite_rules$|^action_scheduler_|^recently_activated$|^auto_(core|plugin)_|^(core|auto)_updater\.lock$|^wpml_notices|^_wpml_|^_icl_cache|^wpdev_|^can_compress_scripts$|^recovery_mode_|^wp_statistics|^wordfence|^itsec|^updraft|^googlesitekit|^ossdl|^wpsupercache|^jetpack_|^health-check}"
+  local meta_skip="${WPDEV_DB_HASH_SKIP_META:-^(_site)?_transient_|^session_tokens$|user-settings|^community-events-location$|^_edit_lock$|^wpml_|^googlesitekit|^itsec|^_wfls|^wfls|^wf_|dashboard|^meta-box-order|^closedpostboxes|^metaboxhidden|^manageedit|^screen_layout|^edit_.*_per_page$|^nav_menu_recently_edited$|^last_update$}"
+
+  local t sql_parts=() q
+  for t in $(sql "SHOW TABLES"); do
+    [[ "${t}" =~ ${skip_re} ]] && continue
+    case "${t}" in
+      *options)
+        q="SELECT MD5(IFNULL(GROUP_CONCAT(CONCAT(option_name,'=',MD5(option_value)) ORDER BY option_name SEPARATOR '|'),'')) FROM \`${t}\` WHERE option_name NOT REGEXP '$(sql_escape "${opt_skip}")'" ;;
+      *sitemeta)
+        q="SELECT MD5(IFNULL(GROUP_CONCAT(CONCAT(meta_id,'=',meta_key,'=',MD5(meta_value)) ORDER BY meta_id SEPARATOR '|'),'')) FROM \`${t}\` WHERE meta_key NOT REGEXP '$(sql_escape "${meta_skip}")'" ;;
+      *usermeta)
+        q="SELECT MD5(IFNULL(GROUP_CONCAT(CONCAT(umeta_id,'=',meta_key,'=',MD5(meta_value)) ORDER BY umeta_id SEPARATOR '|'),'')) FROM \`${t}\` WHERE meta_key NOT REGEXP '$(sql_escape "${meta_skip}")'" ;;
+      *posts)
+        q="SELECT MD5(IFNULL(GROUP_CONCAT(CONCAT_WS('|', ID, post_author, post_date_gmt, post_modified_gmt, post_status, post_type, post_name, post_parent, menu_order, post_mime_type, comment_status, ping_status, post_password, MD5(post_title), MD5(post_content), MD5(post_excerpt)) ORDER BY ID SEPARATOR '#'),'')) FROM \`${t}\` WHERE post_status <> 'auto-draft'" ;;
+      *postmeta|*termmeta|*commentmeta|*blogmeta)
+        q="SELECT MD5(IFNULL(GROUP_CONCAT(CONCAT(meta_id,'=',meta_key,'=',MD5(meta_value)) ORDER BY meta_id SEPARATOR '|'),'')) FROM \`${t}\` WHERE meta_key NOT REGEXP '$(sql_escape "${meta_skip}")'" ;;
+      *)
+        q="" ;;
+    esac
+    local h=""
+    if [ -n "${q}" ]; then
+      h="$(sql "SET SESSION group_concat_max_len = 1073741824; ${q}" 2>/dev/null || true)"
+    fi
+    if [ -n "${h}" ]; then
+      sql_parts+=( "${t} ${h}" )
+    else
+      sql_parts+=( "$(sql "CHECKSUM TABLE \`${t}\`" | tr '\t' ' ')" )
+    fi
+  done
+
+  if [ "${verbose}" = "--verbose" ]; then
+    printf '%s\n' "${sql_parts[@]}"
+  fi
+  printf '%s\n' "${sql_parts[@]}" | md5sum | cut -d' ' -f1
+}
+
+# Prepare a copy of the database for production: reassign and delete the local
+# admin, rewrite URLs. Works on database "golive"; the local database stays untouched.
+cmd_golive() {
+  local prod_url="${1%/}" reassign="${2:-}"
+  local user="${WPDEV_ADMIN_USER:-devadmin}"
+  [ -n "${prod_url}" ] && [[ "${reassign}" =~ ^[0-9]+$ ]] || die "Usage: wpdev golive <production-url> <user-id>"
+  local p
+  p="$(detect_prefix)"
+
+  info "Copying database to 'golive' ..."
+  mysql -uroot -proot -e "DROP DATABASE IF EXISTS golive; CREATE DATABASE golive; GRANT ALL ON golive.* TO 'db'@'%';"
+  mysqldump --single-transaction db | mysql -uroot -proot golive
+
+  gsql() { mysql -uroot -proot -N -B golive -e "$1"; }
+  gwp() { WPDEV_DB_NAME=golive wpcli "$@"; }
+
+  [ -n "$(gsql "SELECT ID FROM \`${p}users\` WHERE ID=${reassign}")" ] || die "User ID ${reassign} does not exist."
+
+  local dev_id
+  dev_id="$(gsql "SELECT ID FROM \`${p}users\` WHERE user_login='$(sql_escape "${user}")'")"
+  if [ -n "${dev_id}" ]; then
+    [ "${dev_id}" != "${reassign}" ] || die "Cannot reassign content to '${user}' itself."
+    info "Reassigning content of '${user}' (ID ${dev_id}) to user ID ${reassign} ..."
+    local t
+    for t in $(gsql "SELECT table_name FROM information_schema.columns WHERE table_schema='golive' AND column_name='post_author'"); do
+      gsql "UPDATE \`${t}\` SET post_author=${reassign} WHERE post_author=${dev_id}"
+    done
+    for t in $(gsql "SELECT table_name FROM information_schema.tables WHERE table_schema='golive' AND table_name LIKE '%postmeta'"); do
+      gsql "UPDATE \`${t}\` SET meta_value='${reassign}' WHERE meta_key='_edit_last' AND meta_value='${dev_id}'"
+    done
+    for t in $(gsql "SELECT table_name FROM information_schema.columns WHERE table_schema='golive' AND column_name='user_id' AND table_name LIKE '%comments'"); do
+      gsql "UPDATE \`${t}\` SET user_id=${reassign} WHERE user_id=${dev_id}"
+    done
+    if table_exists "${p}blogs"; then
+      gwp super-admin remove "${user}" >/dev/null 2>&1 || true
+      gwp user delete "${user}" --network --yes >/dev/null
+    else
+      gwp user delete "${user}" --reassign="${reassign}" --yes >/dev/null
+    fi
+    [ -z "$(gsql "SELECT ID FROM \`${p}users\` WHERE user_login='$(sql_escape "${user}")'")" ] || die "Could not delete '${user}'. Aborting."
+    info "Deleted '${user}'."
+  fi
+
+  read -r _ old_host old_path <<< "$(parse_url "${NEW_URL}")"
+  read -r new_scheme new_host new_path <<< "$(parse_url "${prod_url}")"
+  info "Rewriting ${NEW_URL} -> ${prod_url} ..."
+  local skip="${WPDEV_SR_SKIP_TABLES:-*statistics*,*wfhits,*wffilemods,*wfknownfilelist,*wflivetraffichuman,*itsec_logs,*actionscheduler_logs}"
+  local -a pairs=(
+    "//${old_host}${old_path}" "//${new_host}${new_path}"
+    "\\/\\/${old_host}${old_path//\//\\/}" "\\/\\/${new_host}${new_path//\//\\/}"
+    "%2F%2F${old_host}${old_path//\//%2F}" "%2F%2F${new_host}${new_path//\//%2F}"
+  )
+  if [ "${new_scheme}" = "http" ]; then
+    pairs+=( "https://${new_host}" "http://${new_host}" "https:\\/\\/${new_host}" "http:\\/\\/${new_host}" )
+  fi
+  local i
+  for (( i = 0; i < ${#pairs[@]}; i += 2 )); do
+    gwp search-replace "${pairs[i]}" "${pairs[i+1]}" --all-tables --skip-columns=guid --skip-tables="${skip}" --format=count >/dev/null
+  done
+
+  # GUIDs are skipped above; only posts created locally carry the local host.
+  local t
+  for t in $(gsql "SELECT table_name FROM information_schema.columns WHERE table_schema='golive' AND column_name='guid'"); do
+    gsql "UPDATE \`${t}\` SET guid=REPLACE(guid, '//$(sql_escape "${old_host}${old_path}")', '//$(sql_escape "${new_host}${new_path}")') WHERE guid LIKE '%//$(sql_escape "${old_host}")%'"
+  done
+
+  if table_exists "${p}blogs"; then
+    local nh np
+    nh="$(sql_escape "${new_host}")"; np="$(sql_escape "${new_path}")"
+    gsql "UPDATE \`${p}site\` SET domain='${nh}', path='${np}/';
+          UPDATE \`${p}blogs\` SET domain=REPLACE(domain, '$(sql_escape "${old_host}")', '${nh}'), path=CONCAT('${np}', path);
+          UPDATE \`${p}sitemeta\` SET meta_value='$(sql_escape "${prod_url}")/' WHERE meta_key='siteurl';"
+  fi
+
+  local left
+  left="$(gsql "SELECT COUNT(*) FROM \`${p}options\` WHERE option_value LIKE '%$(sql_escape "${old_host}")%'")"
+  [ "${left}" = "0" ] || warn "${left} rows in ${p}options still contain ${old_host} (base64 or serialized objects?)."
+  info "Database 'golive' is ready for ${prod_url}."
+}
+
+cmd_status() {
+  local p
+  p="$(detect_prefix)"
+  echo "URL:            ${NEW_URL}"
+  echo "Docroot:        ${DOCROOT}"
+  echo "Table prefix:   ${p}"
+  echo "Multisite:      ${WPDEV_MULTISITE:-no}"
+  if [ -f "${WPCONFIG}" ]; then
+    if grep -q '#wpdev-generated' "${WPCONFIG}"; then echo "wp-config.php:  managed by wp-devkit"
+    elif grep -q 'wp-config-devkit.php' "${WPCONFIG}"; then echo "wp-config.php:  custom, loads wp-devkit"
+    else echo "wp-config.php:  custom, does NOT load wp-devkit"; fi
+  else
+    echo "wp-config.php:  missing (run 'ddev wpdev setup')"
+  fi
+  if table_exists "${p}options"; then
+    echo "home (DB):      $(sql "SELECT option_value FROM \`${p}options\` WHERE option_name='home' LIMIT 1")"
+  else
+    echo "home (DB):      no database imported"
+  fi
+  echo "Cron:           $([ "${WPDEV_DISABLE_CRON:-true}" = "true" ] && echo disabled || echo enabled)"
+  echo "External HTTP:  $([ "${WPDEV_BLOCK_EXTERNAL_HTTP:-false}" = "true" ] && echo "blocked (allow: ${WPDEV_HTTP_ALLOW:-*.wordpress.org})" || echo allowed)"
+  echo "Mail:           Mailpit (ddev mailpit)"
+  echo ".user.ini:      $(php -r 'echo ini_get("user_ini.filename") === "" ? "ignored" : "active";')"
+  if table_exists "${p}options"; then
+    echo "Disabled locally (active in DB):"
+    wp --url="${NEW_URL}" eval '
+      foreach ( $GLOBALS["wpdev_raw_plugins"] as $list ) {
+        foreach ( (array) $list as $k => $v ) {
+          $f = is_string( $k ) ? $k : $v;
+          if ( function_exists( "wpdev_is_disabled_plugin" ) && wpdev_is_disabled_plugin( $f ) ) { echo "  - " . strtok( $f, "/" ) . "\n"; }
+        }
+      }' 2>/dev/null | sort -u || echo "  (could not load WordPress)"
+  fi
+}
+
+case "${1:-status}" in
+  setup)   shift; cmd_setup "$@" ;;
+  prepare) shift; cmd_prepare "$@" ;;
+  admin)   shift; cmd_admin "$@" ;;
+  status)  shift; cmd_status "$@" ;;
+  hash)    shift; cmd_hash "$@" ;;
+  golive)  shift; cmd_golive "$@" ;;
+  -h|--help|help)
+    sed -n 's/^## //p' "$0"
+    echo
+    echo "  setup     Create wp-config.php (if missing or DDEV-generated). Runs on 'ddev start'."
+    echo "  prepare   Rewrite URLs of an imported DB to this DDEV site. Runs after 'ddev import-db'."
+    echo "  admin [user] [pass]   Create a local administrator or reset its password."
+    echo "  status    Show the local setup."
+    echo "  hash [--verbose]   Content hash of the database (used by ddev dbsync)."
+    echo "  golive <url> <user-id>   Prepare database 'golive' for production (use ddev dbsync golive)."
+    ;;
+  *) die "Unknown command '$1'. See 'ddev wpdev help'." ;;
+esac

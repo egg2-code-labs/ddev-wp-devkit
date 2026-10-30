@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+#ddev-generated
+# After rebase (not after commit --amend).
+[ "${1:-}" = "rebase" ] || exit 0
+"$(dirname "$0")/_dbsync" pull || true
