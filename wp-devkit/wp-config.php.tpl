@@ -1,5 +1,6 @@
 <?php
 /**
+ * #ddev-generated
  * #wpdev-generated: Created by the ddev-wp-devkit add-on for local development.
  * Remove this line to take ownership; wp-devkit will then never touch this file.
  * Keep this file out of git and never deploy it.

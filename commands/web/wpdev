@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #ddev-generated
 ## Description: WordPress local dev helpers (setup, prepare imported DB, local admin, status)
-## Usage: wpdev [setup|prepare|admin|status] [args]
+## Usage: wpdev [setup|prepare|admin|hash|golive|status] [args]
 ## Example: "ddev wpdev status"\n"ddev wpdev prepare"\n"ddev wpdev admin"\n"ddev wpdev admin myuser mypass"
 ## ProjectTypes: wordpress
 
@@ -64,7 +64,7 @@ cmd_setup() {
       printf("define( %s, %s );\n", var_export($k, true), var_export(bin2hex(random_bytes(32)), true));
     }')"
   php -r 'echo str_replace("__SALTS__", rtrim($argv[2]), file_get_contents($argv[1]));' \
-    "${DEVKIT_DIR}/wp-config.php.tpl" "${salts}" > "${WPCONFIG}"
+    "${DEVKIT_DIR}/wp-config.php.tpl" "${salts}" | sed '/#ddev-generated/d' > "${WPCONFIG}"
   info "Created ${WPCONFIG#/var/www/html/} (local only, keep it out of git)."
 }
 
@@ -95,6 +95,7 @@ cmd_prepare() {
 
   read -r old_scheme old_host old_path <<< "$(parse_url "${old_url}")"
   read -r new_scheme new_host new_path <<< "$(parse_url "${NEW_URL}")"
+  [ -n "${old_host}" ] || die "Could not parse '${old_url}' (option 'home' in the database)."
 
   if [ "${old_host}${old_path}" = "${new_host}${new_path}" ]; then
     info "URLs already point to ${NEW_URL}, no rewrite needed."
@@ -261,6 +262,7 @@ cmd_golive() {
 
   read -r _ old_host old_path <<< "$(parse_url "${NEW_URL}")"
   read -r new_scheme new_host new_path <<< "$(parse_url "${prod_url}")"
+  [ -n "${new_host}" ] || die "Could not parse '${prod_url}'."
   info "Rewriting ${NEW_URL} -> ${prod_url} ..."
   local skip="${WPDEV_SR_SKIP_TABLES:-*statistics*,*wfhits,*wffilemods,*wfknownfilelist,*wflivetraffichuman,*itsec_logs,*actionscheduler_logs}"
   local -a pairs=(

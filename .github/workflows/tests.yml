@@ -36,6 +36,9 @@ jobs:
         ddev_version: [stable]
       fail-fast: false
 
+    # Self-hosted runner prerequisites (expected by ddev/github-action-add-on-test):
+    # Docker, ddev, git, curl, python3, jq and the bats libraries
+    # (bats-core, bats-assert, bats-file, bats-support) on the runner's bats lib path.
     runs-on: self-hosted
 
     steps:

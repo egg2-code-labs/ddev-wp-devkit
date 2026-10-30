@@ -30,6 +30,14 @@ ddev wpdev status
 
 After installation, make sure to commit the `.ddev` directory to version control.
 
+## Requirements
+
+- DDEV v1.24.10 or newer
+- A DDEV project of type `wordpress`
+- `python3` on the host (used by `ddev dbsync`)
+- `rclone` (only for `ddev dbsync` with a remote folder)
+- `git` (database sharing relies on git hooks)
+
 ## Commands
 
 ```bash
@@ -62,6 +70,8 @@ ddev dbsync golive <url> <id>    # production export: reassign devadmin's conten
 Setup: set `WPDEV_DB_REMOTE=<rclone-remote>:` in `.ddev/.env`; every developer creates an rclone remote with that name (`rclone config create <name> drive scope=drive root_folder_id=<folder-id>`). Alternatively use a local folder in `.ddev/.env.local`. The git hooks are activated on `ddev start` via `core.hooksPath`; if it is already set to something else, it is left unchanged.
 
 Skip the hook once: `WPDEV_DB_SKIP=1 git commit ...`
+
+Always commit with a plain `git commit` (or `git commit -a`). `git commit --only <file>` would bypass the pointer staged by the pre-commit hook and silently desynchronize `db/snapshot.json` from the uploaded dump.
 
 ## Configuration
 
@@ -101,6 +111,7 @@ if ( getenv( 'IS_DDEV_PROJECT' ) === 'true' ) { require '/var/www/html/.ddev/wp-
 - Subdomain multisite also needs `additional_hostnames` in the DDEV config.
 - Databases cannot be merged. `ddev dbsync` only makes parallel changes visible (merge conflict); resolving means picking one side and redoing the other side's changes by hand.
 - The content hash ignores known noise. If a plugin writes to the database on every request, every commit creates a new snapshot. Compare `ddev wpdev hash --verbose` before/after a page request and exclude the option via `WPDEV_DB_HASH_SKIP_OPTIONS` / `_META` / `_TABLES`.
+- The content hash aggregates every table in SQL and runs on every `git commit` (pre-commit hook). On small and medium databases this takes seconds; on very large databases it can take considerably longer. `ddev wpdev hash --verbose` shows which tables dominate the run time.
 - rclone's shared Google Drive client ID is being retired in 2026. Create your own OAuth client: https://rclone.org/drive/#making-your-own-client-id
 
 ## Credits
