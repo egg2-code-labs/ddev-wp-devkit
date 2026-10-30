@@ -4,8 +4,12 @@
 # Documentation https://bats-core.readthedocs.io/en/stable/
 # Bats libraries documentation https://github.com/ztombol/bats-docs
 
-# For local tests, install bats-core, bats-assert, bats-file, bats-support
-# And run this in the add-on root directory:
+# For local tests, install bats-core (brew install bats-core) and the assertion
+# libraries from their git repos (they are not on Homebrew), e.g. on macOS:
+#   git clone --depth 1 https://github.com/bats-core/bats-assert /opt/homebrew/lib/bats-assert
+#   git clone --depth 1 https://github.com/bats-core/bats-file /opt/homebrew/lib/bats-file
+#   git clone --depth 1 https://github.com/bats-core/bats-support /opt/homebrew/lib/bats-support
+# Then run this in the add-on root directory:
 #   bats ./tests/test.bats
 # To exclude release tests:
 #   bats ./tests/test.bats --filter-tags '!release'
@@ -52,8 +56,13 @@ health_checks() {
   assert_success
   assert_output --partial "Remote:          <not set>"
 
-  # Install WordPress and verify the wp-devkit helpers work end to end
-  run ddev wp core download
+  # Install WordPress and verify the wp-devkit helpers work end to end.
+  # WordPress is downloaded on the host: api.wordpress.org TLS 1.3 handshakes
+  # fail from OpenSSL 3.5 clients inside containers (curl error 35), while
+  # host curl (Apple TLS) and everything after core install are unaffected.
+  run curl -sfL --max-time 120 -o "${TESTDIR}/wp-latest.tar.gz" https://wordpress.org/latest.tar.gz
+  assert_success
+  run tar -xzf "${TESTDIR}/wp-latest.tar.gz" -C "${TESTDIR}" --strip-components=1
   assert_success
   run ddev wp core install --url="https://${PROJNAME}.ddev.site" --title="wp-devkit" --admin_user=instadmin --admin_password=instadmin --admin_email=instadmin@example.test --skip-email
   assert_success
