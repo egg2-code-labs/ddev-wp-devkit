@@ -180,8 +180,8 @@ cmd_hash() {
   table_exists "${p}options" || { echo "empty"; return 0; }
 
   local skip_re="${WPDEV_DB_HASH_SKIP_TABLES:-statistics|_wf|itsec_|actionscheduler_|yoast_indexable|yoast_seo_links|_sessions|icl_url_resolution_cache|icl_string_positions|cli_cookie_scan|tec_kv_cache|us_filter_index}"
-  local opt_skip="${WPDEV_DB_HASH_SKIP_OPTIONS:-^(_site)?_transient_|^cron$|^rewrite_rules$|^action_scheduler_|^recently_activated$|^auto_(core|plugin)_|^(core|auto)_updater\.lock$|^wpml_notices|^_wpml_|^_icl_cache|^wpdev_|^can_compress_scripts$|^recovery_mode_|^wp_statistics|^wordfence|^itsec|^updraft|^googlesitekit|^ossdl|^wpsupercache|^jetpack_|^health-check}"
-  local meta_skip="${WPDEV_DB_HASH_SKIP_META:-^(_site)?_transient_|^session_tokens$|user-settings|^community-events-location$|^_edit_lock$|^wpml_|^googlesitekit|^itsec|^_wfls|^wfls|^wf_|dashboard|^meta-box-order|^closedpostboxes|^metaboxhidden|^manageedit|^screen_layout|^edit_.*_per_page$|^nav_menu_recently_edited$|^last_update$}"
+  local opt_skip="${WPDEV_DB_HASH_SKIP_OPTIONS:-^(_site)?_transient_|^cron$|^rewrite_rules$|^action_scheduler_|^recently_activated$|^auto_(core|plugin)_|^(core|auto)_updater\.lock$|^wpml_notices|^_wpml_|^_icl_cache|^tec_timed_|^fs_|^wpdev_|^can_compress_scripts$|^recovery_mode_|^wp_statistics|^wordfence|^itsec|^updraft|^googlesitekit|^ossdl|^wpsupercache|^jetpack_|^health-check}"
+  local meta_skip="${WPDEV_DB_HASH_SKIP_META:-^(_site)?_transient_|^fs_|^tec_timed_|^session_tokens$|user-settings|^community-events-location$|^_edit_lock$|^wpml_|^googlesitekit|^itsec|^_wfls|^wfls|^wf_|dashboard|^meta-box-order|^closedpostboxes|^metaboxhidden|^manageedit|^screen_layout|^edit_.*_per_page$|^nav_menu_recently_edited$|^last_update$}"
 
   local t sql_parts=() q
   for t in $(sql "SHOW TABLES"); do
