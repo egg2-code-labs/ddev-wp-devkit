@@ -21,8 +21,17 @@ require __DIR__ . '/wp-config-ddev.php';
 
 __SALTS__
 
-if ( ! defined( 'ABSPATH' ) ) {
-	define( 'ABSPATH', __DIR__ . '/' );
+// Find wp-settings.php like DDEV does: in this directory or in one subdirectory.
+$wpdev_abspath = __DIR__ . '/';
+if ( ! file_exists( __DIR__ . '/wp-settings.php' ) ) {
+	foreach ( glob( __DIR__ . '/*/wp-settings.php' ) ?: array() as $wpdev_wp_settings ) {
+		$wpdev_abspath = dirname( $wpdev_wp_settings ) . '/';
+		break;
+	}
 }
+if ( ! defined( 'ABSPATH' ) ) {
+	define( 'ABSPATH', $wpdev_abspath );
+}
+unset( $wpdev_abspath, $wpdev_wp_settings );
 
 require_once ABSPATH . 'wp-settings.php';
