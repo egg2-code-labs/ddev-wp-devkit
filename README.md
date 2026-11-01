@@ -34,6 +34,7 @@ After installation, make sure to commit the `.ddev` directory to version control
 
 - DDEV v1.24.10 or newer
 - A DDEV project of type `wordpress`
+- WordPress core in the docroot or in one subdirectory below it (like DDEV itself supports; the generated `wp-config.php` detects the location of `wp-settings.php`)
 - `python3` on the host (used by `ddev dbsync`)
 - `rclone` (only for `ddev dbsync` with a remote folder)
 - `git` (database sharing relies on git hooks)
@@ -116,6 +117,6 @@ if ( getenv( 'IS_DDEV_PROJECT' ) === 'true' ) { require '/var/www/html/.ddev/wp-
 
 ## Credits
 
-- Initial implementation of the plugin code by [Florian Behrend](https://github.com/florianbehrend).
+- Initial implementation of the plugin code by [Florian Behrend](https://github.com/florianbehend).
 
 **Contributed and maintained by [@egg2-code-labs](https://github.com/egg2-code-labs)**
