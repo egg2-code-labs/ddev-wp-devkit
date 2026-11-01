@@ -117,6 +117,6 @@ if ( getenv( 'IS_DDEV_PROJECT' ) === 'true' ) { require '/var/www/html/.ddev/wp-
 
 ## Credits
 
-- Initial implementation of the plugin code by [Florian Behrend](https://github.com/florianbehend).
+- Initial implementation of the plugin code by [Florian Behrend](https://github.com/florianbehrend).
 
 **Contributed and maintained by [@egg2-code-labs](https://github.com/egg2-code-labs)**
