@@ -112,6 +112,11 @@ teardown() {
 # bats test_tags=release
 @test "install from release" {
   set -eu -o pipefail
+  # Requires a first release to exist (tagged 'release'; skipped until then so
+  # scheduled runs on main do not fail before the first release is cut).
+  if [ -z "$(git ls-remote --tags "https://github.com/${GITHUB_REPO}.git" 2>/dev/null)" ]; then
+    skip "No GitHub release yet; cut a release (e.g. v0.1.0) to enable this test."
+  fi
   echo "# ddev add-on get ${GITHUB_REPO} with project ${PROJNAME} in $(pwd)" >&3
   run ddev add-on get "${GITHUB_REPO}"
   assert_success
