@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+#ddev-generated
+# Shared by the wp-devkit git hooks. Never blocks git when DDEV is unavailable.
+export PATH="/opt/homebrew/bin:/usr/local/bin:${PATH}"
+[ "${WPDEV_DB_SKIP:-}" = "1" ] && exit 0
+command -v ddev >/dev/null || { echo "dbsync: ddev not found, skipping database sync." >&2; exit 0; }
+cd "$(git rev-parse --show-toplevel)" || exit 0
+exec ddev dbsync "$@"

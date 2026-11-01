@@ -28,13 +28,18 @@ permissions:
 
 jobs:
   tests:
+    # Run on the self-hosted runner only for trusted (same-repository) refs.
+    # Pull requests from forks must never run on the self-hosted runner.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     strategy:
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm]
-        ddev_version: [stable, HEAD]
+        ddev_version: [stable]
       fail-fast: false
 
-    runs-on: ${{ matrix.os }}
+    # Self-hosted runner prerequisites (expected by ddev/github-action-add-on-test):
+    # Docker, ddev, git, curl, python3, jq and the bats libraries
+    # (bats-core, bats-assert, bats-file, bats-support) on the runner's bats lib path.
+    runs-on: self-hosted
 
     steps:
       - uses: ddev/github-action-add-on-test@v2

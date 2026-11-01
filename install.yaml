@@ -1,6 +1,44 @@
 name: wp-devkit
 
 project_files:
-  - docker-compose.wp-devkit.yaml
+  - config.wp-devkit.yaml
+  - commands/web/wpdev
+  - commands/host/dbsync
+  - php/wp-devkit.ini
+  - wp-devkit/wp-config-devkit.php
+  - wp-devkit/wp-config.php.tpl
+  - wp-devkit/githooks/_dbsync
+  - wp-devkit/githooks/pre-commit
+  - wp-devkit/githooks/post-checkout
+  - wp-devkit/githooks/post-merge
+  - wp-devkit/githooks/post-rewrite
+
+pre_install_actions:
+  - |
+    #ddev-description:Check project type
+    if [ "${DDEV_PROJECT_TYPE}" != "wordpress" ]; then
+      echo "Warning: wp-devkit is meant for WordPress projects (type is '${DDEV_PROJECT_TYPE}')."
+    fi
+
+post_install_actions:
+  - |
+    #ddev-description:Next steps
+    echo "wp-devkit installed. Run 'ddev restart', then 'ddev wpdev status'."
+    echo "Configure via .ddev/.env (see README: WPDEV_* variables)."
+    echo "Database sharing: set WPDEV_DB_REMOTE, then 'ddev dbsync status'."
+
+removal_actions:
+  - |
+    #ddev-description:Remove git hooks path
+    if [ "$(git -C "${DDEV_APPROOT}" config core.hooksPath 2>/dev/null)" = ".ddev/wp-devkit/githooks" ]; then
+      git -C "${DDEV_APPROOT}" config --unset core.hooksPath
+    fi
+  - |
+    #ddev-description:Remove generated wp-config.php if it was created by wp-devkit
+    WPCONFIG="${DDEV_APPROOT}/${DDEV_DOCROOT}/wp-config.php"
+    if [ -f "${WPCONFIG}" ] && grep -q '#wpdev-generated' "${WPCONFIG}"; then
+      rm -f "${WPCONFIG}"
+      echo "Removed ${WPCONFIG}"
+    fi
 
 ddev_version_constraint: '>= v1.24.10'

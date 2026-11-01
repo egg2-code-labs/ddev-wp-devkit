@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+#ddev-generated
+# $3 = 1 for branch checkouts (not for checking out single files).
+[ "${3:-1}" = "1" ] || exit 0
+"$(dirname "$0")/_dbsync" pull || true

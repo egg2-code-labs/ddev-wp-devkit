@@ -1,0 +1,9 @@
+#ddev-generated
+# wp-devkit: local WordPress development helpers.
+# Hooks are merged with the project's own hooks.
+hooks:
+  post-start:
+    - exec: /var/www/html/.ddev/commands/web/wpdev setup --quiet
+    - exec-host: ddev dbsync install-hooks --quiet
+  post-import-db:
+    - exec: /var/www/html/.ddev/commands/web/wpdev prepare

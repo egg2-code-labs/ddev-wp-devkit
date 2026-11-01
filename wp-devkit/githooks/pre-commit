@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+#ddev-generated
+# Export + upload the database if content changed, add db/snapshot.json to this commit.
+# Skip once with: WPDEV_DB_SKIP=1 git commit ...
+exec "$(dirname "$0")/_dbsync" push

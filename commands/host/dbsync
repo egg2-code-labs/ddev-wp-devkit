@@ -1,0 +1,304 @@
+#!/usr/bin/env bash
+#ddev-generated
+## Description: Share the WordPress database via a remote folder (Google Drive via rclone), pointer in git
+## Usage: dbsync [status|pull|push|resolve|init|golive|install-hooks] [args]
+## Example: "ddev dbsync status"\n"ddev dbsync pull"\n"ddev dbsync push"\n"ddev dbsync init ~/Downloads/prod.sql.gz"\n"ddev dbsync golive https://example.com 1"
+## ProjectTypes: wordpress
+
+set -euo pipefail
+
+export PATH="/opt/homebrew/bin:/usr/local/bin:${PATH}"
+
+APPROOT="${DDEV_APPROOT:-$(pwd)}"
+POINTER_REL="db/snapshot.json"
+POINTER="${APPROOT}/${POINTER_REL}"
+CACHE_DIR="${APPROOT}/.ddev/.wpdev"
+STATE="${CACHE_DIR}/state.json"
+HOOKS_REL=".ddev/wp-devkit/githooks"
+
+info() { echo "dbsync: $*"; }
+warn() { echo "dbsync: WARNING: $*" >&2; }
+die() { echo "dbsync: ERROR: $*" >&2; exit 1; }
+
+# Settings: .ddev/.env (shared, committed), .ddev/.env.local (personal, gitignored).
+env_get() {
+  local key="$1" value="" f
+  for f in "${APPROOT}/.ddev/.env" "${APPROOT}/.ddev/.env.local"; do
+    [ -f "${f}" ] || continue
+    local line
+    line="$(grep -E "^${key}=" "${f}" | tail -1 || true)"
+    [ -n "${line}" ] && value="${line#*=}"
+  done
+  value="${value%\"}"; value="${value#\"}"
+  printf '%s' "${value/#\~/${HOME}}"
+}
+
+REMOTE="$(env_get WPDEV_DB_REMOTE)"
+REMOTE="${REMOTE%/}"
+
+is_local_remote() { [[ "${REMOTE}" == /* ]]; }
+
+require_remote() {
+  local hint=" (Commit without database: WPDEV_DB_SKIP=1 git commit ...)"
+  [ -n "${REMOTE}" ] || die "WPDEV_DB_REMOTE is not set. Add it to .ddev/.env (rclone remote, e.g. 'wp-db:') or .ddev/.env.local (local folder).${hint}"
+  if ! is_local_remote; then
+    command -v rclone >/dev/null || die "rclone is not installed (brew install rclone), see README.${hint}"
+    rclone listremotes | grep -qx "${REMOTE%%:*}:" || die "rclone remote '${REMOTE%%:*}:' not configured, see README.${hint}"
+  fi
+}
+
+remote_put() { # local_file name
+  if is_local_remote; then
+    mkdir -p "${REMOTE}" && cp "$1" "${REMOTE}/$2.partial" && mv "${REMOTE}/$2.partial" "${REMOTE}/$2"
+  else
+    rclone copyto "$1" "${REMOTE}/$2"
+  fi
+}
+
+remote_get() { # name local_file
+  if is_local_remote; then
+    [ -f "${REMOTE}/$1" ] || return 1
+    cp "${REMOTE}/$1" "$2"
+  else
+    rclone copyto "${REMOTE}/$1" "$2"
+  fi
+}
+
+sha256() {
+  if command -v shasum >/dev/null; then shasum -a 256 "$1" | cut -d' ' -f1
+  else sha256sum "$1" | cut -d' ' -f1; fi
+}
+
+json_get() { # file key
+  [ -f "$1" ] || return 0
+  python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))' "$1" "$2"
+}
+
+json_get_stdin() { # key
+  python3 -I -c 'import json,sys; print(json.load(sys.stdin).get(sys.argv[1], ""))' "$1"
+}
+
+ddev_running() {
+  ddev describe -j 2>/dev/null | python3 -I -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["raw"]["status"] == "running" else 1)'
+}
+
+current_hash() { ddev wpdev hash 2>/dev/null | tail -1; }
+
+write_state() { # file content_hash
+  mkdir -p "${CACHE_DIR}"
+  [ -f "${CACHE_DIR}/.gitignore" ] || echo '*' > "${CACHE_DIR}/.gitignore"
+  python3 -I -c 'import json,sys; json.dump({"file": sys.argv[2], "content_hash": sys.argv[3]}, open(sys.argv[1], "w"), indent=2)' "${STATE}" "$1" "$2"
+}
+
+pointer_conflicted() { [ -f "${POINTER}" ] && grep -q '^<<<<<<<' "${POINTER}"; }
+
+conflict_help() {
+  warn "Merge conflict in ${POINTER_REL}: the database was changed on both sides."
+  warn "Databases cannot be merged. Pick one side and redo the other side's content changes by hand:"
+  warn "  ddev dbsync resolve ours     keep this branch's database"
+  warn "  ddev dbsync resolve theirs   take the merged-in branch's database"
+  warn "Then redo the missing changes in WordPress and commit (the hook exports the result)."
+}
+
+# Import the snapshot the pointer refers to.
+cmd_pull() {
+  local force="${1:-}"
+  [ -f "${POINTER}" ] || { info "No ${POINTER_REL} yet, nothing to pull."; return 0; }
+  if pointer_conflicted; then conflict_help; return 0; fi
+  ddev_running || { warn "DDEV is not running, skipping database pull. Run 'ddev start && ddev dbsync pull'."; return 0; }
+
+  local file sha content_hash
+  file="$(json_get "${POINTER}" file)"
+  sha="$(json_get "${POINTER}" sha256)"
+  content_hash="$(json_get "${POINTER}" content_hash)"
+  [ -n "${file}" ] || die "${POINTER_REL} has no 'file' (merge conflict?). Resolve it first, see README."
+
+  if [ "$(json_get "${STATE}" file)" = "${file}" ] && [ "${force}" != "--force" ]; then
+    info "Database is up to date (${file})."
+    return 0
+  fi
+
+  # Never silently overwrite local changes.
+  local loaded_hash now_hash
+  loaded_hash="$(json_get "${STATE}" content_hash)"
+  if [ "${force}" != "--force" ] && [ -n "${loaded_hash}" ]; then
+    now_hash="$(current_hash)"
+    if [ "${now_hash}" != "${loaded_hash}" ]; then
+      warn "Your local database has changes that are not in any snapshot."
+      warn "NOT importing ${file}. Either commit them on the branch they belong to,"
+      warn "or discard them with: ddev dbsync pull --force"
+      return 0
+    fi
+  fi
+
+  require_remote
+  mkdir -p "${CACHE_DIR}"
+  local local_file="${CACHE_DIR}/${file}"
+  if [ ! -f "${local_file}" ] || [ "$(sha256 "${local_file}")" != "${sha}" ]; then
+    info "Downloading ${file} ..."
+    remote_get "${file}" "${local_file}.download" || die "Could not download ${file} from ${REMOTE} (not synced yet?). Try again: ddev dbsync pull"
+    mv "${local_file}.download" "${local_file}"
+  fi
+  [ "$(sha256 "${local_file}")" = "${sha}" ] || die "Checksum mismatch for ${file}. Delete ${local_file} and try again."
+
+  info "Importing ${file} ..."
+  ddev import-db --file="${local_file}" >/dev/null
+  write_state "${file}" "$(current_hash)"
+  info "Database is now ${file}."
+}
+
+# Export the local database if it differs from the staged pointer. Used by pre-commit.
+cmd_push() {
+  ddev_running || { warn "DDEV is not running, database not checked. Start DDEV and commit again if you changed content."; return 0; }
+  local now_hash
+  now_hash="$(current_hash)"
+  [ -n "${now_hash}" ] && [ "${now_hash}" != "empty" ] || { info "No WordPress database, nothing to push."; return 0; }
+
+  # Compare with the pointer that is about to be committed (index), fall back to working tree.
+  local staged parent=""
+  staged="$(git -C "${APPROOT}" show ":${POINTER_REL}" 2>/dev/null || true)"
+  if [ -n "${staged}" ]; then
+    if [ "$(printf '%s' "${staged}" | json_get_stdin content_hash)" = "${now_hash}" ]; then
+      return 0
+    fi
+    parent="$(printf '%s' "${staged}" | json_get_stdin file)"
+  fi
+
+  require_remote
+  local author stamp file local_file
+  author="$(git -C "${APPROOT}" config user.name | tr -cs 'A-Za-z0-9' '-' | tr 'A-Z' 'a-z' | sed 's/-*$//')"
+  stamp="$(date -u +%Y%m%d-%H%M%S)"
+  file="${stamp}_${author:-unknown}_${now_hash:0:8}.sql.gz"
+  local_file="${CACHE_DIR}/${file}"
+  mkdir -p "${CACHE_DIR}"
+
+  info "Database changed, exporting ${file} ..."
+  ddev export-db --gzip --file="${local_file}" >/dev/null
+  info "Uploading to ${REMOTE} ..."
+  remote_put "${local_file}" "${file}"
+
+  mkdir -p "$(dirname "${POINTER}")"
+  python3 -I - "${POINTER}" "${file}" "$(sha256 "${local_file}")" "${now_hash}" "${parent}" "$(git -C "${APPROOT}" config user.name)" <<'PY'
+import json, sys, datetime
+path, file, sha, content_hash, parent, author = sys.argv[1:7]
+json.dump({
+    "file": file,
+    "sha256": sha,
+    "content_hash": content_hash,
+    "parent": parent,
+    "author": author,
+    "created": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+}, open(path, "w"), indent=2)
+open(path, "a").write("\n")
+PY
+  git -C "${APPROOT}" add "${POINTER_REL}"
+  write_state "${file}" "${now_hash}"
+  info "Snapshot ${file} added to this commit (${POINTER_REL})."
+}
+
+# First import from a production dump: rewrite URLs, create local admin, then snapshot on next commit.
+cmd_init() {
+  local dump="${1:-}"
+  [ -f "${dump}" ] || die "Usage: ddev dbsync init <dump.sql|.sql.gz|.tar.xz ...>"
+  ddev_running || die "DDEV is not running."
+  info "Importing ${dump} ..."
+  ddev import-db --file="${dump}"
+  ddev wpdev admin --if-missing
+  rm -f "${STATE}"
+  info "Done. Commit now ('git commit'), the pre-commit hook uploads the first snapshot."
+}
+
+# Resolve a merge conflict in the pointer by choosing one side.
+cmd_resolve() {
+  local side="${1:-}"
+  [[ "${side}" =~ ^(ours|theirs)$ ]] || die "Usage: ddev dbsync resolve ours|theirs"
+  pointer_conflicted || die "No merge conflict in ${POINTER_REL}."
+  local other="theirs"; [ "${side}" = "theirs" ] && other="ours"
+  local other_json
+  other_json="$(git -C "${APPROOT}" show ":$([ "${other}" = "ours" ] && echo 2 || echo 3):${POINTER_REL}" 2>/dev/null || true)"
+  git -C "${APPROOT}" checkout "--${side}" -- "${POINTER_REL}"
+  git -C "${APPROOT}" add "${POINTER_REL}"
+  cmd_pull --force
+  if [ -n "${other_json}" ]; then
+    info "Not taken (${other}): $(printf '%s' "${other_json}" | json_get_stdin file) by $(printf '%s' "${other_json}" | json_get_stdin author)."
+    info "Redo those content changes by hand, then 'git commit' to finish the merge."
+  fi
+}
+
+cmd_status() {
+  echo "Remote:          ${REMOTE:-<not set>}"
+  if pointer_conflicted; then
+    echo "Pointer:         MERGE CONFLICT"
+    conflict_help
+    return 0
+  fi
+  if [ -f "${POINTER}" ]; then
+    echo "Pointer:         $(json_get "${POINTER}" file) (by $(json_get "${POINTER}" author), $(json_get "${POINTER}" created))"
+  else
+    echo "Pointer:         none (${POINTER_REL} missing)"
+  fi
+  echo "Loaded locally:  $(json_get "${STATE}" file)"
+  if ddev_running; then
+    local now loaded
+    now="$(current_hash)"; loaded="$(json_get "${STATE}" content_hash)"
+    if [ -z "${loaded}" ]; then echo "Local changes:   unknown (no snapshot loaded via dbsync)"
+    elif [ "${now}" = "${loaded}" ]; then echo "Local changes:   none"
+    else echo "Local changes:   YES (exported on next commit)"; fi
+  else
+    echo "Local changes:   DDEV not running"
+  fi
+  echo "Git hooks:       $(git -C "${APPROOT}" config core.hooksPath || echo 'not installed')"
+}
+
+cmd_install_hooks() {
+  local quiet="${1:-}"
+  git -C "${APPROOT}" rev-parse --git-dir >/dev/null 2>&1 || return 0
+  local current
+  current="$(git -C "${APPROOT}" config core.hooksPath || true)"
+  if [ -n "${current}" ] && [ "${current}" != "${HOOKS_REL}" ]; then
+    warn "core.hooksPath is already '${current}'. Not changing it; call 'ddev dbsync push/pull' from your own hooks."
+    return 0
+  fi
+  if [ -z "${current}" ]; then
+    git -C "${APPROOT}" config core.hooksPath "${HOOKS_REL}"
+    info "Git hooks installed (core.hooksPath=${HOOKS_REL})."
+  elif [ "${quiet}" != "--quiet" ]; then
+    info "Git hooks already installed."
+  fi
+}
+
+# Go-live: copy the DB, reassign/delete the local admin, rewrite URLs to production, export.
+cmd_golive() {
+  local url="${1:-}" reassign="${2:-}"
+  [ -n "${url}" ] && [ -n "${reassign}" ] || die "Usage: ddev dbsync golive <production-url> <user-id-to-reassign-content-to>"
+  ddev_running || die "DDEV is not running."
+  local out="${CACHE_DIR}/golive_$(date +%Y%m%d-%H%M%S).sql.gz"
+  mkdir -p "${CACHE_DIR}"
+  ddev wpdev golive "${url}" "${reassign}"
+  ddev export-db --database=golive --gzip --file="${out}" >/dev/null
+  ddev mysql -uroot -proot -e "DROP DATABASE golive" >/dev/null
+  info "Go-live database: ${out}"
+  info "Your local database is unchanged."
+}
+
+case "${1:-status}" in
+  pull) shift; cmd_pull "$@" ;;
+  push) shift; cmd_push "$@" ;;
+  init) shift; cmd_init "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  resolve) shift; cmd_resolve "$@" ;;
+  golive) shift; cmd_golive "$@" ;;
+  install-hooks) shift; cmd_install_hooks "$@" ;;
+  -h|--help|help)
+    sed -n 's/^## //p' "$0"
+    echo
+    echo "  status          Remote, pointer, loaded snapshot, local changes"
+    echo "  pull [--force]  Import the snapshot from ${POINTER_REL} (runs after checkout/merge)"
+    echo "  push            Export + upload if the DB changed, update ${POINTER_REL} (runs on commit)"
+    echo "  resolve ours|theirs   Resolve a merge conflict in ${POINTER_REL}"
+    echo "  init <dump>     First import of a production dump (URL rewrite + local admin)"
+    echo "  golive <url> <user-id>   Build the production database export"
+    echo "  install-hooks   Set core.hooksPath (runs on ddev start)"
+    ;;
+  *) die "Unknown command '$1'. See 'ddev dbsync help'." ;;
+esac
