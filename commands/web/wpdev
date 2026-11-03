@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #ddev-generated
 ## Description: WordPress local dev helpers (setup, prepare imported DB, local admin, status)
-## Usage: wpdev [setup|prepare|admin|hash|golive|status] [args]
+## Usage: wpdev [setup|prepare|admin|hash|edits|golive|status] [args]
 ## Example: "ddev wpdev status"\n"ddev wpdev prepare"\n"ddev wpdev admin"\n"ddev wpdev admin myuser mypass"
 ## ProjectTypes: wordpress
 
@@ -12,6 +12,9 @@ DOCROOT="${DOCROOT%/}"
 DEVKIT_DIR="/var/www/html/.ddev/wp-devkit"
 WPCONFIG="${DOCROOT}/wp-config.php"
 NEW_URL="${DDEV_PRIMARY_URL%/}"
+
+# Internal WP-CLI calls (URL rewrite, local admin, go-live) are not edits for ddev dbsync.
+export WPDEV_NO_DIRTY=1
 
 info() { echo "wpdev: $*"; }
 warn() { echo "wpdev: WARNING: $*" >&2; }
@@ -171,21 +174,92 @@ cmd_admin() {
   info "Login: ${NEW_URL}/wp-login.php"
 }
 
+# Change detection mode for ddev dbsync: "edits" (default) or "hash" (legacy).
+change_detection() { echo "${WPDEV_DB_CHANGE_DETECTION:-edits}"; }
+
+# Hash policy of the current mode. The policy is stored with every snapshot, so
+# hashes are only ever compared when they were computed the same way.
+#   full-v1     every table, minus known noise (WPDEV_DB_HASH_SKIP_*). Mode "hash".
+#   content-v1  content tables only (posts, terms, comments, menus, WPML
+#               translation links). Mode "edits"; settings and plugin tables
+#               are covered by the recorded edits instead.
+default_hash_policy() {
+  if [ "$(change_detection)" = "hash" ]; then echo "full-v1"; else echo "content-v1"; fi
+}
+
+# Edits recorded by wp-config-devkit.php, one line each. All access happens here,
+# inside the container where PHP appends to the file: with Mutagen, the host copy
+# lags behind, and renaming it on the host could lose or resurrect lines.
+# While a push exports the database, the edits wait in EDITS_PUSHING; edits made
+# meanwhile go to a new EDITS file and belong to the next snapshot.
+EDITS="/var/www/html/.ddev/.wpdev/dirty"
+EDITS_PUSHING="${EDITS}.pushing"
+
+edits_cat() { local f; for f in "${EDITS_PUSHING}" "${EDITS}"; do [ ! -f "${f}" ] || cat "${f}"; done; }
+
+cmd_edits() {
+  case "${1:-count}" in
+    count) edits_cat | wc -l | tr -d ' ' ;;
+    show) edits_cat | tail -"${2:-3}" ;;
+    add)
+      mkdir -p "${EDITS%/*}"
+      [ -f "${EDITS%/*}/.gitignore" ] || echo '*' > "${EDITS%/*}/.gitignore"
+      # add <user> <signature words ...>: ddev re-splits command arguments at spaces.
+      printf '%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${*:3}" "${2:?user}" >> "${EDITS}" ;;
+    begin) # rename is atomic: a request appending right now ends up in one of the two files
+      [ -f "${EDITS}" ] || return 0
+      if [ -f "${EDITS_PUSHING}" ]; then # a push that did not finish: keep its edits too
+        mv "${EDITS}" "${EDITS}.tmp"
+        cat "${EDITS}.tmp" >> "${EDITS_PUSHING}"
+        rm -f "${EDITS}.tmp"
+      else
+        mv "${EDITS}" "${EDITS_PUSHING}"
+      fi ;;
+    done) rm -f "${EDITS_PUSHING}" ;;
+    clear) rm -f "${EDITS}" "${EDITS_PUSHING}" ;;
+    *) die "Usage: wpdev edits [count|show [n]|add <user> <signature>|begin|done|clear]" ;;
+  esac
+}
+
 # Content hash of the database, ignoring data that changes without anyone editing
 # content (transients, cron, sessions, edit locks, logs, statistics, caches).
 cmd_hash() {
-  local verbose="${1:-}"
+  local verbose="" policy=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --verbose) verbose="--verbose" ;;
+      --policy) shift; policy="${1:-}" ;;
+      --policy=*) policy="${1#--policy=}" ;;
+      *) die "Usage: wpdev hash [--verbose] [--policy full-v1|content-v1]" ;;
+    esac
+    shift
+  done
+  policy="${policy:-$(default_hash_policy)}"
+  [[ "${policy}" =~ ^(full-v1|content-v1)$ ]] || die "Unknown hash policy '${policy}' (this wp-devkit knows full-v1, content-v1). Update wp-devkit."
+
   local p
   p="$(detect_prefix)"
   table_exists "${p}options" || { echo "empty"; return 0; }
 
-  local skip_re="${WPDEV_DB_HASH_SKIP_TABLES:-statistics|_wf|itsec_|actionscheduler_|yoast_indexable|yoast_seo_links|_sessions|icl_url_resolution_cache|icl_string_positions|cli_cookie_scan|tec_kv_cache|us_filter_index}"
-  local opt_skip="${WPDEV_DB_HASH_SKIP_OPTIONS:-^(_site)?_transient_|^cron$|^rewrite_rules$|^action_scheduler_|^recently_activated$|^auto_(core|plugin)_|^(core|auto)_updater\.lock$|^wpml_notices|^_wpml_|^_icl_cache|^tec_timed_|^fs_|^wpdev_|^can_compress_scripts$|^recovery_mode_|^wp_statistics|^wordfence|^itsec|^updraft|^googlesitekit|^ossdl|^wpsupercache|^jetpack_|^health-check}"
-  local meta_skip="${WPDEV_DB_HASH_SKIP_META:-^(_site)?_transient_|^fs_|^tec_timed_|^session_tokens$|user-settings|^community-events-location$|^_edit_lock$|^wpml_|^googlesitekit|^itsec|^_wfls|^wfls|^wf_|dashboard|^meta-box-order|^closedpostboxes|^metaboxhidden|^manageedit|^screen_layout|^edit_.*_per_page$|^nav_menu_recently_edited$|^last_update$}"
+  local skip_re opt_skip meta_skip only_re=""
+  if [ "${policy}" = "full-v1" ]; then
+    skip_re="${WPDEV_DB_HASH_SKIP_TABLES:-statistics|_wf|itsec_|actionscheduler_|yoast_indexable|yoast_seo_links|_sessions|icl_url_resolution_cache|icl_string_positions|cli_cookie_scan|tec_kv_cache|us_filter_index}"
+    opt_skip="${WPDEV_DB_HASH_SKIP_OPTIONS:-^(_site)?_transient_|^cron$|^rewrite_rules$|^action_scheduler_|^recently_activated$|^auto_(core|plugin)_|^(core|auto)_updater\.lock$|^wpml_notices|^_wpml_|^_icl_cache|^tec_timed_|^fs_|^wpdev_|^can_compress_scripts$|^recovery_mode_|^wp_statistics|^wordfence|^itsec|^updraft|^googlesitekit|^ossdl|^wpsupercache|^jetpack_|^health-check}"
+    meta_skip="${WPDEV_DB_HASH_SKIP_META:-^(_site)?_transient_|^fs_|^tec_timed_|^session_tokens$|user-settings|^community-events-location$|^_edit_lock$|^wpml_|^googlesitekit|^itsec|^_wfls|^wfls|^wf_|dashboard|^meta-box-order|^closedpostboxes|^metaboxhidden|^manageedit|^screen_layout|^edit_.*_per_page$|^nav_menu_recently_edited$|^last_update$}"
+  else
+    local prefix_re
+    prefix_re="$(printf '%s' "${p}" | sed 's/[][\\.^$*+?(){}|]/\\&/g')"
+    only_re="^${prefix_re}([0-9]+_)?(posts|postmeta|terms|termmeta|term_taxonomy|term_relationships|comments|commentmeta|links|icl_translations)$"
+    [ -n "${WPDEV_DB_HASH_CONTENT_TABLES:-}" ] && only_re="${only_re}|${WPDEV_DB_HASH_CONTENT_TABLES}"
+    skip_re="${WPDEV_DB_HASH_SKIP_TABLES:-}"
+    opt_skip="${WPDEV_DB_HASH_SKIP_OPTIONS:-^(_site)?_transient_}"
+    meta_skip="${WPDEV_DB_HASH_SKIP_META:-^(_site)?_transient_|^_edit_lock$}"
+  fi
 
   local t sql_parts=() q
   for t in $(sql "SHOW TABLES"); do
-    [[ "${t}" =~ ${skip_re} ]] && continue
+    [ -n "${only_re}" ] && ! [[ "${t}" =~ ${only_re} ]] && continue
+    [ -n "${skip_re}" ] && [[ "${t}" =~ ${skip_re} ]] && continue
     case "${t}" in
       *options)
         q="SELECT MD5(IFNULL(GROUP_CONCAT(CONCAT(option_name,'=',MD5(option_value)) ORDER BY option_name SEPARATOR '|'),'')) FROM \`${t}\` WHERE option_name NOT REGEXP '$(sql_escape "${opt_skip}")'" ;;
@@ -320,6 +394,7 @@ cmd_status() {
   echo "Cron:           $([ "${WPDEV_DISABLE_CRON:-true}" = "true" ] && echo disabled || echo enabled)"
   echo "External HTTP:  $([ "${WPDEV_BLOCK_EXTERNAL_HTTP:-false}" = "true" ] && echo "blocked (allow: ${WPDEV_HTTP_ALLOW:-*.wordpress.org})" || echo allowed)"
   echo "Mail:           Mailpit (ddev mailpit)"
+  echo "DB changes:     $(change_detection) (hash policy $(default_hash_policy))"
   echo ".user.ini:      $(php -r 'echo ini_get("user_ini.filename") === "" ? "ignored" : "active";')"
   if table_exists "${p}options"; then
     echo "Disabled locally (active in DB):"
@@ -339,6 +414,7 @@ case "${1:-status}" in
   admin)   shift; cmd_admin "$@" ;;
   status)  shift; cmd_status "$@" ;;
   hash)    shift; cmd_hash "$@" ;;
+  edits)   shift; cmd_edits "$@" ;;
   golive)  shift; cmd_golive "$@" ;;
   -h|--help|help)
     sed -n 's/^## //p' "$0"
@@ -347,7 +423,8 @@ case "${1:-status}" in
     echo "  prepare   Rewrite URLs of an imported DB to this DDEV site. Runs after 'ddev import-db'."
     echo "  admin [user] [pass]   Create a local administrator or reset its password."
     echo "  status    Show the local setup."
-    echo "  hash [--verbose]   Content hash of the database (used by ddev dbsync)."
+    echo "  hash [--verbose] [--policy full-v1|content-v1]   Content hash of the database (used by ddev dbsync)."
+    echo "  edits [count|show|add|begin|done|clear]   Edits recorded for ddev dbsync."
     echo "  golive <url> <user-id>   Prepare database 'golive' for production (use ddev dbsync golive)."
     ;;
   *) die "Unknown command '$1'. See 'ddev wpdev help'." ;;

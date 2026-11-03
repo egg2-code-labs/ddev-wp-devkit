@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #ddev-generated
 ## Description: Share the WordPress database via a remote folder (Google Drive via rclone), pointer in git
-## Usage: dbsync [status|pull|push|resolve|init|golive|install-hooks] [args]
+## Usage: dbsync [status|pull|push|mark-dirty|resolve|init|golive|install-hooks] [args]
 ## Example: "ddev dbsync status"\n"ddev dbsync pull"\n"ddev dbsync push"\n"ddev dbsync init ~/Downloads/prod.sql.gz"\n"ddev dbsync golive https://example.com 1"
 ## ProjectTypes: wordpress
 
@@ -14,6 +14,8 @@ POINTER_REL="db/snapshot.json"
 POINTER="${APPROOT}/${POINTER_REL}"
 CACHE_DIR="${APPROOT}/.ddev/.wpdev"
 STATE="${CACHE_DIR}/state.json"
+# Snapshots and states written before hash policies existed use the old algorithm.
+LEGACY_POLICY="full-v1"
 HOOKS_REL=".ddev/wp-devkit/githooks"
 
 info() { echo "dbsync: $*"; }
@@ -35,6 +37,11 @@ env_get() {
 
 REMOTE="$(env_get WPDEV_DB_REMOTE)"
 REMOTE="${REMOTE%/}"
+
+CHANGE_DETECTION="$(env_get WPDEV_DB_CHANGE_DETECTION)"
+CHANGE_DETECTION="${CHANGE_DETECTION:-edits}"
+[[ "${CHANGE_DETECTION}" =~ ^(edits|hash)$ ]] || die "WPDEV_DB_CHANGE_DETECTION must be 'edits' or 'hash', not '${CHANGE_DETECTION}'."
+if [ "${CHANGE_DETECTION}" = "hash" ]; then POLICY="full-v1"; else POLICY="content-v1"; fi
 
 is_local_remote() { [[ "${REMOTE}" == /* ]]; }
 
@@ -82,12 +89,46 @@ ddev_running() {
   ddev describe -j 2>/dev/null | python3 -I -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["raw"]["status"] == "running" else 1)'
 }
 
-current_hash() { ddev wpdev hash 2>/dev/null | tail -1; }
+current_hash() { # [policy]
+  ddev wpdev hash --policy "${1:-${POLICY}}" 2>/dev/null | tail -1
+}
 
-write_state() { # file content_hash
+ensure_cache_dir() {
   mkdir -p "${CACHE_DIR}"
   [ -f "${CACHE_DIR}/.gitignore" ] || echo '*' > "${CACHE_DIR}/.gitignore"
-  python3 -I -c 'import json,sys; json.dump({"file": sys.argv[2], "content_hash": sys.argv[3]}, open(sys.argv[1], "w"), indent=2)' "${STATE}" "$1" "$2"
+}
+
+write_state() { # file content_hash
+  ensure_cache_dir
+  python3 -I -c 'import json,sys; json.dump({"file": sys.argv[2], "content_hash": sys.argv[3], "hash_policy": sys.argv[4]}, open(sys.argv[1], "w"), indent=2)' "${STATE}" "$1" "$2" "${POLICY}"
+}
+
+# Edits recorded by wp-config-devkit.php. They live in the container ("ddev wpdev
+# edits"), never read them from the host: with Mutagen the host copy lags behind.
+edits() { ddev wpdev edits "$@"; }
+
+edit_count() {
+  [ "${CHANGE_DETECTION}" = "edits" ] || { echo 0; return 0; }
+  local n
+  n="$(edits count 2>/dev/null || true)"
+  [[ "${n}" =~ ^[0-9]+$ ]] && echo "${n}" || echo 0
+}
+
+has_edits() { [ "$(edit_count)" -gt 0 ]; }
+
+edit_summary() { edits show 3 | sed 's/^/dbsync:   /'; }
+
+# Does the database differ from a snapshot with this hash? Compares with the
+# snapshot's own hash policy; "" (no hash known) counts as unknown, not as changed.
+hash_differs() { # content_hash policy
+  [ -n "$1" ] || return 1
+  [ "$(current_hash "${2:-${LEGACY_POLICY}}")" != "$1" ]
+}
+
+# Local changes that are not in the loaded snapshot: recorded edits or a changed hash.
+has_local_changes() {
+  has_edits && return 0
+  hash_differs "$(json_get "${STATE}" content_hash)" "$(json_get "${STATE}" hash_policy)"
 }
 
 pointer_conflicted() { [ -f "${POINTER}" ] && grep -q '^<<<<<<<' "${POINTER}"; }
@@ -119,16 +160,12 @@ cmd_pull() {
   fi
 
   # Never silently overwrite local changes.
-  local loaded_hash now_hash
-  loaded_hash="$(json_get "${STATE}" content_hash)"
-  if [ "${force}" != "--force" ] && [ -n "${loaded_hash}" ]; then
-    now_hash="$(current_hash)"
-    if [ "${now_hash}" != "${loaded_hash}" ]; then
-      warn "Your local database has changes that are not in any snapshot."
-      warn "NOT importing ${file}. Either commit them on the branch they belong to,"
-      warn "or discard them with: ddev dbsync pull --force"
-      return 0
-    fi
+  if [ "${force}" != "--force" ] && has_local_changes; then
+    warn "Your local database has changes that are not in any snapshot."
+    has_edits && edit_summary >&2
+    warn "NOT importing ${file}. Either commit them on the branch they belong to,"
+    warn "or discard them with: ddev dbsync pull --force"
+    return 0
   fi
 
   require_remote
@@ -143,28 +180,47 @@ cmd_pull() {
 
   info "Importing ${file} ..."
   ddev import-db --file="${local_file}" >/dev/null
+  edits clear
   write_state "${file}" "$(current_hash)"
   info "Database is now ${file}."
 }
 
-# Export the local database if it differs from the staged pointer. Used by pre-commit.
+# Export the local database if it has recorded edits or differs from the staged
+# pointer. Used by pre-commit.
 cmd_push() {
   ddev_running || { warn "DDEV is not running, database not checked. Start DDEV and commit again if you changed content."; return 0; }
   local now_hash
   now_hash="$(current_hash)"
   [ -n "${now_hash}" ] && [ "${now_hash}" != "empty" ] || { info "No WordPress database, nothing to push."; return 0; }
 
-  # Compare with the pointer that is about to be committed (index), fall back to working tree.
-  local staged parent=""
+  # Compare with the pointer that is about to be committed (index), using the
+  # hash policy that pointer was written with.
+  local staged parent="" edited
+  edited="$(edit_count)"
   staged="$(git -C "${APPROOT}" show ":${POINTER_REL}" 2>/dev/null || true)"
   if [ -n "${staged}" ]; then
-    if [ "$(printf '%s' "${staged}" | json_get_stdin content_hash)" = "${now_hash}" ]; then
-      return 0
-    fi
     parent="$(printf '%s' "${staged}" | json_get_stdin file)"
+    if [ "${edited}" -eq 0 ]; then
+      local staged_hash staged_policy
+      staged_hash="$(printf '%s' "${staged}" | json_get_stdin content_hash)"
+      staged_policy="$(printf '%s' "${staged}" | json_get_stdin hash_policy)"
+      staged_policy="${staged_policy:-${LEGACY_POLICY}}"
+      if [ "${staged_policy}" = "${POLICY}" ]; then
+        [ "${staged_hash}" = "${now_hash}" ] && return 0
+      else
+        hash_differs "${staged_hash}" "${staged_policy}" || return 0
+      fi
+    fi
   fi
 
   require_remote
+  if [ "${edited}" -gt 0 ]; then
+    info "Recorded edits since the last snapshot (${edited}), latest:"
+    edit_summary
+    # Edits recorded from now on belong to the next snapshot.
+    edits begin
+  fi
+
   local author stamp file local_file
   author="$(git -C "${APPROOT}" config user.name | tr -cs 'A-Za-z0-9' '-' | tr 'A-Z' 'a-z' | sed 's/-*$//')"
   stamp="$(date -u +%Y%m%d-%H%M%S)"
@@ -178,13 +234,14 @@ cmd_push() {
   remote_put "${local_file}" "${file}"
 
   mkdir -p "$(dirname "${POINTER}")"
-  python3 -I - "${POINTER}" "${file}" "$(sha256 "${local_file}")" "${now_hash}" "${parent}" "$(git -C "${APPROOT}" config user.name)" <<'PY'
+  python3 -I - "${POINTER}" "${file}" "$(sha256 "${local_file}")" "${now_hash}" "${POLICY}" "${parent}" "$(git -C "${APPROOT}" config user.name)" <<'PY'
 import json, sys, datetime
-path, file, sha, content_hash, parent, author = sys.argv[1:7]
+path, file, sha, content_hash, hash_policy, parent, author = sys.argv[1:8]
 json.dump({
     "file": file,
     "sha256": sha,
     "content_hash": content_hash,
+    "hash_policy": hash_policy,
     "parent": parent,
     "author": author,
     "created": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -193,6 +250,7 @@ open(path, "a").write("\n")
 PY
   git -C "${APPROOT}" add "${POINTER_REL}"
   write_state "${file}" "${now_hash}"
+  edits done
   info "Snapshot ${file} added to this commit (${POINTER_REL})."
 }
 
@@ -205,7 +263,24 @@ cmd_init() {
   ddev import-db --file="${dump}"
   ddev wpdev admin --if-missing
   rm -f "${STATE}"
+  edits clear
+  record_edit "dbsync init ${dump##*/}"
   info "Done. Commit now ('git commit'), the pre-commit hook uploads the first snapshot."
+}
+
+record_edit() { # signature
+  local user
+  user="$(git -C "${APPROOT}" config user.name | tr -cs 'A-Za-z0-9._-' '-' | sed 's/-*$//' || true)"
+  # Plain words only: the arguments pass through a shell inside the container.
+  edits add "${user:-unknown}" $(printf '%s' "$1" | tr -cs 'A-Za-z0-9._:/@-' ' ')
+}
+
+# For changes wp-devkit cannot see: direct SQL, "wp db query", database GUIs.
+cmd_mark_dirty() {
+  [ "${CHANGE_DETECTION}" = "edits" ] || die "WPDEV_DB_CHANGE_DETECTION is 'hash': only the content hash detects changes."
+  ddev_running || die "DDEV is not running."
+  record_edit "manual ${*:-dbsync mark-dirty}"
+  info "Marked the database as changed. The next commit exports a snapshot."
 }
 
 # Resolve a merge conflict in the pointer by choosing one side.
@@ -238,12 +313,18 @@ cmd_status() {
     echo "Pointer:         none (${POINTER_REL} missing)"
   fi
   echo "Loaded locally:  $(json_get "${STATE}" file)"
-  if ddev_running; then
-    local now loaded
-    now="$(current_hash)"; loaded="$(json_get "${STATE}" content_hash)"
+  echo "Detection:       ${CHANGE_DETECTION} (hash policy ${POLICY})"
+  local edited=0
+  ddev_running && edited="$(edit_count)"
+  if [ "${edited}" -gt 0 ]; then
+    echo "Local changes:   YES, ${edited} recorded edit(s) (exported on next commit), latest:"
+    edit_summary
+  elif ddev_running; then
+    local loaded
+    loaded="$(json_get "${STATE}" content_hash)"
     if [ -z "${loaded}" ]; then echo "Local changes:   unknown (no snapshot loaded via dbsync)"
-    elif [ "${now}" = "${loaded}" ]; then echo "Local changes:   none"
-    else echo "Local changes:   YES (exported on next commit)"; fi
+    elif hash_differs "${loaded}" "$(json_get "${STATE}" hash_policy)"; then echo "Local changes:   YES, content hash changed (exported on next commit)"
+    else echo "Local changes:   none"; fi
   else
     echo "Local changes:   DDEV not running"
   fi
@@ -284,6 +365,7 @@ cmd_golive() {
 case "${1:-status}" in
   pull) shift; cmd_pull "$@" ;;
   push) shift; cmd_push "$@" ;;
+  mark-dirty) shift; cmd_mark_dirty "$@" ;;
   init) shift; cmd_init "$@" ;;
   status) shift; cmd_status "$@" ;;
   resolve) shift; cmd_resolve "$@" ;;
@@ -295,6 +377,7 @@ case "${1:-status}" in
     echo "  status          Remote, pointer, loaded snapshot, local changes"
     echo "  pull [--force]  Import the snapshot from ${POINTER_REL} (runs after checkout/merge)"
     echo "  push            Export + upload if the DB changed, update ${POINTER_REL} (runs on commit)"
+    echo "  mark-dirty [note]   Record a change wp-devkit cannot see (direct SQL), exported on next commit"
     echo "  resolve ours|theirs   Resolve a merge conflict in ${POINTER_REL}"
     echo "  init <dump>     First import of a production dump (URL rewrite + local admin)"
     echo "  golive <url> <user-id>   Build the production database export"

@@ -48,6 +48,7 @@ ddev wpdev admin             # create local admin "devadmin" / "devadmin" or res
 ddev wpdev admin name pass   # with your own name/password
 ddev wpdev setup             # create wp-config.php (runs automatically on ddev start)
 ddev wpdev hash [--verbose]  # content hash of the database (used by ddev dbsync)
+ddev wpdev edits show 10     # last edits recorded for ddev dbsync
 ```
 
 ## Sharing the database (`ddev dbsync`)
@@ -56,14 +57,31 @@ The database lives in a shared remote folder (Google Drive via rclone, any other
 
 | When | What |
 |---|---|
-| `git commit` (pre-commit) | Content hash of the database ≠ pointer → `ddev export-db`, upload, the new pointer is added to the commit |
+| `git commit` (pre-commit) | Recorded edits, or content hash ≠ pointer → `ddev export-db`, upload, the new pointer is added to the commit |
 | `git checkout` / `merge` / `rebase` | Pointer ≠ loaded snapshot → download, SHA check, `ddev import-db`. Unsaved local changes are never overwritten. |
 | Merge conflict in `db/snapshot.json` | Both sides changed the database → `ddev dbsync resolve ours\|theirs` |
 
-The content hash ignores data that changes without anyone editing content: transients, cron, sessions, edit locks, auto-drafts, WPML caches, logs, statistics and security tables. Browsing or logging in does not create a snapshot.
+### How changes are detected
+
+Plugins write to the database all the time (caches, counters, notices, update checks), so comparing database contents cannot tell real edits from noise. By default (`WPDEV_DB_CHANGE_DETECTION=edits`) wp-devkit therefore records **edits** while WordPress runs. A database write counts as an edit when it happens
+
+- in a non-GET request of a logged-in user (saving posts, settings, menus, media, page builders, REST/AJAX saves),
+- in an admin URL with a nonce opened by a logged-in user (activating a plugin, trashing a post and other GET actions),
+- in a WP-CLI command (`ddev wp ...`), except `cron`, `transient`, `cache` and `rewrite flush`.
+
+Anonymous visitors, page views, logins, the heartbeat, screen options and statistics hits never count, whichever plugin writes. Each edit is one line in `.ddev/.wpdev/dirty` (`ddev wpdev edits show`, `ddev dbsync status`). Add project-specific noise with `WPDEV_DIRTY_IGNORE_EXTRA`, a regex matched against the signature shown there, e.g. `^POST /wp-admin/admin-ajax\.php action=my_plugin_ping$`.
+
+In addition, the content hash covers the content tables only (posts, postmeta, terms, comments, links, WPML translation links; extend with `WPDEV_DB_HASH_CONTENT_TABLES`). It catches content changes made without WordPress, e.g. with direct SQL. Settings changed that way are invisible: record them with `ddev dbsync mark-dirty "what changed"`.
+
+Edits made while a commit exports the database are kept for the next snapshot; if an export fails, its edits stay recorded.
+
+`WPDEV_DB_CHANGE_DETECTION=hash` restores the previous behaviour: no edit recording, the hash covers every table minus known noise (`WPDEV_DB_HASH_SKIP_*`), and every plugin that writes in the background needs its own exclusion.
+
+**Hash policies.** Every snapshot pointer stores the `hash_policy` its hash was computed with (`content-v1` for `edits`, `full-v1` for `hash`; pointers without it are `full-v1`). wp-devkit only compares hashes computed with the same policy, so upgrading or switching the mode never produces a spurious snapshot and never hides a change. Upgrade wp-devkit for the whole team at once: older versions do not know about policies and export a snapshot on every commit after a newer version wrote a pointer.
 
 ```bash
 ddev dbsync status | pull [--force] | push | resolve ours|theirs
+ddev dbsync mark-dirty "note"    # record a change wp-devkit cannot see (direct SQL, database GUI)
 ddev dbsync init <dump>          # first import from production: rewrite URLs + create devadmin
 ddev dbsync golive <url> <id>    # production export: reassign devadmin's content to <id>, delete devadmin, rewrite URLs back
 ```
@@ -92,6 +110,9 @@ In `.ddev/.env` (committed), then `ddev restart`:
 | `WPDEV_ADMIN_USER` / `_PASSWORD` / `_EMAIL` | `devadmin` / `devadmin` / `<user>@example.test` | Defaults for `ddev wpdev admin` |
 | `WPDEV_ADMIN_AUTO` | `false` | Create the admin after every import if missing |
 | `WPDEV_DB_REMOTE` | empty | Target for `ddev dbsync`: rclone remote (`name:path`) or absolute local path |
+| `WPDEV_DB_CHANGE_DETECTION` | `edits` | `edits`: record edits + content-table hash. `hash`: hash over all tables only (previous behaviour) |
+| `WPDEV_DIRTY_IGNORE_EXTRA` | empty | Regex: request signatures that are not edits (see `ddev wpdev edits show`) |
+| `WPDEV_DB_HASH_CONTENT_TABLES` | empty | Regex: additional tables for the content hash (mode `edits`) |
 | `WPDEV_DB_HASH_SKIP_TABLES` / `_OPTIONS` / `_META` | see `commands/web/wpdev` | Regex: what does not affect the content hash |
 
 Project-specific PHP constants (e.g. dev license keys, WPML settings) go into `.ddev/wp-config-project.php`, which is loaded first.
@@ -111,8 +132,9 @@ if ( getenv( 'IS_DDEV_PROJECT' ) === 'true' ) { require '/var/www/html/.ddev/wp-
 - Multisite: user names need at least 4 characters, `admin` is not allowed.
 - Subdomain multisite also needs `additional_hostnames` in the DDEV config.
 - Databases cannot be merged. `ddev dbsync` only makes parallel changes visible (merge conflict); resolving means picking one side and redoing the other side's changes by hand.
-- The content hash ignores known noise. If a plugin writes to the database on every request, every commit creates a new snapshot. Compare `ddev wpdev hash --verbose` before/after a page request and exclude the option via `WPDEV_DB_HASH_SKIP_OPTIONS` / `_META` / `_TABLES`.
-- The content hash aggregates every table in SQL and runs on every `git commit` (pre-commit hook). On small and medium databases this takes seconds; on very large databases it can take considerably longer. `ddev wpdev hash --verbose` shows which tables dominate the run time.
+- Edit detection is a heuristic. A plugin that writes on every logged-in POST (e.g. a tracking ping) creates a snapshot on the next commit: `ddev wpdev edits show` names the request, exclude it with `WPDEV_DIRTY_IGNORE_EXTRA`. Settings changed outside WordPress (direct SQL, `wp db query`, database GUIs) are not detected: use `ddev dbsync mark-dirty`.
+- With `WPDEV_DB_CHANGE_DETECTION=hash`, if a plugin writes to the database on every request, every commit creates a new snapshot. Compare `ddev wpdev hash --verbose` before/after a page request and exclude the option via `WPDEV_DB_HASH_SKIP_OPTIONS` / `_META` / `_TABLES`.
+- The content hash aggregates the hashed tables in SQL and runs on every `git commit` (pre-commit hook). On small and medium databases this takes seconds; on very large databases it can take considerably longer. `ddev wpdev hash --verbose` shows which tables dominate the run time.
 - rclone's shared Google Drive client ID is being retired in 2026. Create your own OAuth client: https://rclone.org/drive/#making-your-own-client-id
 
 ## Credits

@@ -196,3 +196,105 @@ wpdev_add_early_hook( 'phpmailer_init', 'wpdev_force_mailpit', PHP_INT_MAX );
 if ( wpdev_env_bool( 'WPDEV_DISABLE_CRON', true ) ) {
 	wpdev_add_early_hook( 'action_scheduler_allow_async_request_runner', '__return_false', PHP_INT_MAX );
 }
+
+/**
+ * Edit detection for "ddev dbsync" (WPDEV_DB_CHANGE_DETECTION=edits, the default).
+ *
+ * Plugins write to the database all the time (caches, counters, notices, update
+ * checks), so comparing database contents cannot tell real edits from noise
+ * without a rule per plugin. Instead, a database write counts as an edit when it
+ * happens in an edit context:
+ *
+ * - a logged-in user sends a non-GET request (saving a post, settings, media,
+ *   page builders, REST/AJAX saves), or
+ * - a logged-in user opens an admin URL with a nonce (activating a plugin,
+ *   trashing a post and other admin actions that use GET links), or
+ * - a WP-CLI command (except cron/transient/cache housekeeping).
+ *
+ * Each edit appends one line to .ddev/.wpdev/dirty; the pre-commit hook exports
+ * the database when that file exists. Writes by anonymous visitors, by page
+ * views (GET) and by the WordPress heartbeat never count.
+ */
+const WPDEV_DIRTY_FILE = '/var/www/html/.ddev/.wpdev/dirty';
+
+// Request signatures ("METHOD /path action=..." or "cli <command>") that never count
+// as edits: login, heartbeat, screen options, statistics hits, WP-CLI housekeeping.
+// Projects add their own with WPDEV_DIRTY_IGNORE_EXTRA (one regex).
+const WPDEV_DIRTY_IGNORE = array(
+	'^[A-Z]+ /wp-login\.php',
+	'^POST /wp-admin/admin-ajax\.php action=(heartbeat|wp-remove-post-lock|closed-postboxes|meta-box-order|hidden-columns|dismiss-wp-pointer)$',
+	'/wp-statistics/',
+	'^POST /wp-json/\S*/hit$',
+	'^cli (cron|transient|cache)( |$)',
+	'^cli rewrite flush$',
+);
+
+$GLOBALS['wpdev_db_written'] = false;
+
+function wpdev_detect_writes( $query ) {
+	if ( ! $GLOBALS['wpdev_db_written']
+		&& preg_match( '/^\s*(INSERT|UPDATE|DELETE|REPLACE|ALTER|CREATE|DROP|TRUNCATE|RENAME)\b/i', $query )
+		&& ! preg_match( '/_(site_)?transient_/', $query ) ) {
+		$GLOBALS['wpdev_db_written'] = true;
+	}
+	return $query;
+}
+
+/**
+ * Describe the current request, e.g. "POST /wp-admin/post.php action=editpost"
+ * or "cli post update". Returns null outside an edit context.
+ */
+function wpdev_edit_signature() {
+	if ( defined( 'WP_CLI' ) && WP_CLI ) {
+		$args = class_exists( 'WP_CLI' ) ? WP_CLI::get_runner()->arguments : array();
+		return 'cli ' . implode( ' ', array_slice( (array) $args, 0, 2 ) );
+	}
+	if ( ! function_exists( 'is_user_logged_in' ) || ! is_user_logged_in() ) {
+		return null;
+	}
+	$method = isset( $_SERVER['REQUEST_METHOD'] ) ? strtoupper( $_SERVER['REQUEST_METHOD'] ) : 'GET';
+	$is_get = in_array( $method, array( 'GET', 'HEAD', 'OPTIONS' ), true );
+	if ( $is_get && ! ( is_admin() && isset( $_REQUEST['_wpnonce'] ) ) ) {
+		return null;
+	}
+	$path      = (string) parse_url( isset( $_SERVER['REQUEST_URI'] ) ? $_SERVER['REQUEST_URI'] : '/', PHP_URL_PATH );
+	$signature = $method . ' ' . $path;
+	if ( isset( $_GET['rest_route'] ) && is_string( $_GET['rest_route'] ) ) {
+		$signature = $method . ' /wp-json' . $_GET['rest_route'];
+	}
+	if ( isset( $_REQUEST['action'] ) && is_string( $_REQUEST['action'] ) ) {
+		$signature .= ' action=' . $_REQUEST['action'];
+	}
+	return $signature;
+}
+
+function wpdev_record_edit() {
+	if ( ! $GLOBALS['wpdev_db_written'] ) {
+		return;
+	}
+	$signature = wpdev_edit_signature();
+	if ( null === $signature ) {
+		return;
+	}
+	foreach ( array_filter( array_merge( WPDEV_DIRTY_IGNORE, array( wpdev_env( 'WPDEV_DIRTY_IGNORE_EXTRA' ) ) ) ) as $pattern ) {
+		if ( @preg_match( '#' . str_replace( '#', '\#', $pattern ) . '#', $signature ) ) {
+			return;
+		}
+	}
+	$dir = dirname( WPDEV_DIRTY_FILE );
+	if ( ! is_dir( $dir ) ) {
+		@mkdir( $dir, 0775, true );
+		@file_put_contents( $dir . '/.gitignore', "*\n" );
+	}
+	$user = function_exists( 'wp_get_current_user' ) ? wp_get_current_user()->user_login : '';
+	@file_put_contents(
+		WPDEV_DIRTY_FILE,
+		gmdate( 'Y-m-d\TH:i:s\Z' ) . "\t" . $signature . ( $user ? "\t" . $user : '' ) . "\n",
+		FILE_APPEND | LOCK_EX
+	);
+}
+
+if ( 'edits' === wpdev_env( 'WPDEV_DB_CHANGE_DETECTION', 'edits' ) && ! wpdev_env_bool( 'WPDEV_NO_DIRTY', false ) ) {
+	wpdev_add_early_hook( 'query', 'wpdev_detect_writes', PHP_INT_MAX );
+	wpdev_add_early_hook( 'shutdown', 'wpdev_record_edit', PHP_INT_MAX, 0 );
+}
