@@ -209,7 +209,8 @@ if ( wpdev_env_bool( 'WPDEV_DISABLE_CRON', true ) ) {
  *   page builders, REST/AJAX saves), or
  * - a logged-in user opens an admin URL with a nonce (activating a plugin,
  *   trashing a post and other admin actions that use GET links), or
- * - a WP-CLI command (except cron/transient/cache housekeeping).
+ * - a WP-CLI command (except read-only commands and cron/transient/cache
+ *   housekeeping).
  *
  * Each edit appends one line to .ddev/.wpdev/dirty; the pre-commit hook exports
  * the database when that file exists. Writes by anonymous visitors, by page
@@ -218,15 +219,20 @@ if ( wpdev_env_bool( 'WPDEV_DISABLE_CRON', true ) ) {
 const WPDEV_DIRTY_FILE = '/var/www/html/.ddev/.wpdev/dirty';
 
 // Request signatures ("METHOD /path action=..." or "cli <command>") that never count
-// as edits: login, heartbeat, screen options, statistics hits, WP-CLI housekeeping.
+// as edits: login, heartbeat, screen options, list filters, statistics hits,
+// read-only and housekeeping WP-CLI commands.
 // Projects add their own with WPDEV_DIRTY_IGNORE_EXTRA (one regex).
 const WPDEV_DIRTY_IGNORE = array(
 	'^[A-Z]+ /wp-login\.php',
 	'^POST /wp-admin/admin-ajax\.php action=(heartbeat|wp-remove-post-lock|closed-postboxes|meta-box-order|hidden-columns|dismiss-wp-pointer)$',
+	'^POST \S+ screen-options$',
+	'^GET \S+ action=-1$',
 	'/wp-statistics/',
 	'^POST /wp-json/\S*/hit$',
 	'^cli (cron|transient|cache)( |$)',
 	'^cli rewrite flush$',
+	'^cli (help|cli|info)( |$)',
+	'^cli \S+ (list|get|exists|is-installed|is-active|search|status|count|pluck|path|type|has|check-update|verify-checksums|version)( |$)',
 );
 
 $GLOBALS['wpdev_db_written'] = false;
@@ -268,7 +274,7 @@ function wpdev_edit_signature() {
 	}
 	$method = isset( $_SERVER['REQUEST_METHOD'] ) ? strtoupper( $_SERVER['REQUEST_METHOD'] ) : 'GET';
 	$is_get = in_array( $method, array( 'GET', 'HEAD', 'OPTIONS' ), true );
-	if ( $is_get && ! ( is_admin() && isset( $_REQUEST['_wpnonce'] ) ) ) {
+	if ( $is_get && ! ( is_admin() && wpdev_has_nonce() ) ) {
 		return null;
 	}
 	$path = (string) parse_url( isset( $_SERVER['REQUEST_URI'] ) ? $_SERVER['REQUEST_URI'] : '/', PHP_URL_PATH );
@@ -285,20 +291,54 @@ function wpdev_edit_signature() {
 	if ( isset( $_GET['rest_route'] ) && is_string( $_GET['rest_route'] ) ) {
 		$signature = $method . ' /wp-json' . $_GET['rest_route'];
 	}
-	if ( isset( $_REQUEST['action'] ) && is_string( $_REQUEST['action'] ) ) {
-		$signature .= ' action=' . $_REQUEST['action'];
+	if ( isset( $_POST['wp_screen_options'] ) ) {
+		return $signature . ' screen-options';
+	}
+	// List tables send both dropdowns; "-1" means none (a filter or search).
+	$action = isset( $_REQUEST['action'] ) && is_string( $_REQUEST['action'] ) ? $_REQUEST['action'] : null;
+	if ( ( null === $action || '-1' === $action ) && isset( $_REQUEST['action2'] ) && is_string( $_REQUEST['action2'] ) ) {
+		$action = $_REQUEST['action2'];
+	}
+	if ( null !== $action ) {
+		$signature .= ' action=' . $action;
 	}
 	return $signature;
 }
 
+// A nonce in any common form: _wpnonce, _ajax_nonce, nonce, my_plugin_nonce, X-WP-Nonce.
+function wpdev_has_nonce() {
+	if ( ! empty( $_SERVER['HTTP_X_WP_NONCE'] ) ) {
+		return true;
+	}
+	foreach ( array_keys( $_REQUEST ) as $key ) {
+		if ( false !== stripos( (string) $key, 'nonce' ) ) {
+			return true;
+		}
+	}
+	return false;
+}
+
 function wpdev_record_edit() {
-	if ( ! $GLOBALS['wpdev_db_written'] ) {
+	static $done = false, $deferred = false;
+	if ( $done ) {
 		return;
 	}
+	if ( ! $GLOBALS['wpdev_db_written'] ) {
+		// Plugins may write in their own shutdown functions, registered after
+		// WordPress' shutdown hook: check once more at the very end.
+		if ( ! $deferred ) {
+			$deferred = true;
+			register_shutdown_function( 'wpdev_record_edit' );
+		}
+		return;
+	}
+	$done      = true;
 	$signature = wpdev_edit_signature();
 	if ( null === $signature ) {
 		return;
 	}
+	// One printable line: request data must not break the file or the terminal.
+	$signature = substr( preg_replace( '/[^\x20-\x7e]+/', '?', $signature ), 0, 200 );
 	foreach ( array_filter( array_merge( WPDEV_DIRTY_IGNORE, array( wpdev_env( 'WPDEV_DIRTY_IGNORE_EXTRA' ) ) ) ) as $pattern ) {
 		if ( @preg_match( '#' . str_replace( '#', '\#', $pattern ) . '#', $signature ) ) {
 			return;
@@ -309,7 +349,7 @@ function wpdev_record_edit() {
 		@mkdir( $dir, 0775, true );
 		@file_put_contents( $dir . '/.gitignore', "*\n" );
 	}
-	$user = function_exists( 'wp_get_current_user' ) ? wp_get_current_user()->user_login : '';
+	$user = function_exists( 'wp_get_current_user' ) ? preg_replace( '/[^\x20-\x7e]+/', '?', wp_get_current_user()->user_login ) : '';
 	@file_put_contents(
 		WPDEV_DIRTY_FILE,
 		gmdate( 'Y-m-d\TH:i:s\Z' ) . "\t" . $signature . ( $user ? "\t" . $user : '' ) . "\n",

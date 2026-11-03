@@ -190,34 +190,38 @@ default_hash_policy() {
 # Edits recorded by wp-config-devkit.php, one line each. All access happens here,
 # inside the container where PHP appends to the file: with Mutagen, the host copy
 # lags behind, and renaming it on the host could lose or resurrect lines.
-# While a push exports the database, the edits wait in EDITS_PUSHING; edits made
-# meanwhile go to a new EDITS file and belong to the next snapshot.
+# While a push exports the database, its edits wait in EDITS_PUSHING.<id>; edits
+# made meanwhile go to a new EDITS file and belong to the next snapshot.
 EDITS="/var/www/html/.ddev/.wpdev/dirty"
 EDITS_PUSHING="${EDITS}.pushing"
 
-edits_cat() { local f; for f in "${EDITS_PUSHING}" "${EDITS}"; do [ ! -f "${f}" ] || cat "${f}"; done; }
+edits_cat() {
+  local f
+  for f in "${EDITS_PUSHING}".* "${EDITS}"; do [ ! -f "${f}" ] || cat "${f}"; done
+}
+
+# Does WordPress load the runtime that records edits?
+edits_recording() {
+  [ "$(change_detection)" = "edits" ] || return 1
+  [ -f "${WPCONFIG}" ] && grep -qE '#wpdev-generated|wp-config-devkit\.php' "${WPCONFIG}"
+}
 
 cmd_edits() {
   case "${1:-count}" in
     count) edits_cat | wc -l | tr -d ' ' ;;
+    state) # "<on|off> <count>", read by ddev dbsync in one call
+      echo "$(edits_recording && echo on || echo off) $(edits_cat | wc -l | tr -d ' ')" ;;
     show) edits_cat | tail -"${2:-3}" ;;
     add)
       mkdir -p "${EDITS%/*}"
       [ -f "${EDITS%/*}/.gitignore" ] || echo '*' > "${EDITS%/*}/.gitignore"
       # add <user> <signature words ...>: ddev re-splits command arguments at spaces.
       printf '%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${*:3}" "${2:?user}" >> "${EDITS}" ;;
-    begin) # rename is atomic: a request appending right now ends up in one of the two files
-      [ -f "${EDITS}" ] || return 0
-      if [ -f "${EDITS_PUSHING}" ]; then # a push that did not finish: keep its edits too
-        mv "${EDITS}" "${EDITS}.tmp"
-        cat "${EDITS}.tmp" >> "${EDITS_PUSHING}"
-        rm -f "${EDITS}.tmp"
-      else
-        mv "${EDITS}" "${EDITS_PUSHING}"
-      fi ;;
-    done) rm -f "${EDITS_PUSHING}" ;;
-    clear) rm -f "${EDITS}" "${EDITS_PUSHING}" ;;
-    *) die "Usage: wpdev edits [count|show [n]|add <user> <signature>|begin|done|clear]" ;;
+    begin) # rename is atomic: a request appending right now ends up in one of the files
+      [ ! -f "${EDITS}" ] || mv "${EDITS}" "${EDITS_PUSHING}.$(date +%s%N)" ;;
+    done) rm -f "${EDITS_PUSHING}".* ;;
+    clear) rm -f "${EDITS}" "${EDITS_PUSHING}".* ;;
+    *) die "Usage: wpdev edits [count|state|show [n]|add <user> <signature>|begin|done|clear]" ;;
   esac
 }
 
@@ -424,7 +428,7 @@ case "${1:-status}" in
     echo "  admin [user] [pass]   Create a local administrator or reset its password."
     echo "  status    Show the local setup."
     echo "  hash [--verbose] [--policy full-v1|content-v1]   Content hash of the database (used by ddev dbsync)."
-    echo "  edits [count|show|add|begin|done|clear]   Edits recorded for ddev dbsync."
+    echo "  edits [count|state|show|add|begin|done|clear]   Edits recorded for ddev dbsync."
     echo "  golive <url> <user-id>   Prepare database 'golive' for production (use ddev dbsync golive)."
     ;;
   *) die "Unknown command '$1'. See 'ddev wpdev help'." ;;

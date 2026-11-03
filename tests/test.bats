@@ -109,7 +109,7 @@ edit_detection_checks() {
   assert_success
 
   # WP-CLI writes count as edits ("wp core install" above)
-  run ddev wpdev edits show
+  run ddev wpdev edits show 50
   assert_output --partial "cli core install"
 
   # The first commit exports a snapshot with the content-v1 hash policy and clears the edits
@@ -148,7 +148,7 @@ edit_detection_checks() {
   assert_output "302"
   run ddev wp option get blogname
   assert_output "Edited"
-  run ddev wpdev edits show
+  run ddev wpdev edits show 50
   assert_output --partial "POST /wp-admin/options.php action=update"
   assert_equal "$(ddev wpdev hash | tail -1)" "${hash_before}"
   run ddev dbsync status
@@ -184,10 +184,28 @@ edit_detection_checks() {
   run edits_count
   assert_output "1"
 
+  # A plugin that writes on every request (like SEO indexers): read-only WP-CLI commands,
+  # list filters and screen options stay quiet.
+  mkdir -p wp-content/mu-plugins
+  cat > wp-content/mu-plugins/wpdev-noise.php <<'PHP'
+<?php
+add_action( 'init', function () { update_option( 'wpdev_noise', microtime() ); } );
+PHP
+  ddev mutagen sync >/dev/null 2>&1 || true
+  ddev wpdev edits clear
+  ddev wp option get blogname >/dev/null
+  ddev wp post list >/dev/null
+  web "'${url}/wp-admin/edit.php?s=x&action=-1&_wpnonce=abc&action2=-1'" >/dev/null
+  web -d "'wp_screen_options[option]=edit_post_per_page&wp_screen_options[value]=50&screenoptionnonce=abc'" "${url}/wp-admin/edit.php" >/dev/null
+  run edits_count
+  assert_output "0"
+  rm wp-content/mu-plugins/wpdev-noise.php
+  ddev mutagen sync >/dev/null 2>&1 || true
+
   # Changes wp-devkit cannot see are recorded by hand
   run ddev dbsync mark-dirty "direct SQL"
   assert_success
-  run ddev wpdev edits show
+  run ddev wpdev edits show 50
   assert_output --partial "manual direct SQL"
 
   # The legacy policy still computes the hash of earlier wp-devkit versions

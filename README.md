@@ -66,14 +66,16 @@ The database lives in a shared remote folder (Google Drive via rclone, any other
 Plugins write to the database all the time (caches, counters, notices, update checks), so comparing database contents cannot tell real edits from noise. By default (`WPDEV_DB_CHANGE_DETECTION=edits`) wp-devkit therefore records **edits** while WordPress runs. A database write counts as an edit when it happens
 
 - in a non-GET request of a logged-in user (saving posts, settings, menus, media, page builders, REST/AJAX saves),
-- in an admin URL with a nonce opened by a logged-in user (activating a plugin, trashing a post and other GET actions),
-- in a WP-CLI command (`ddev wp ...`), except `cron`, `transient`, `cache` and `rewrite flush`.
+- in an admin URL with a nonce opened by a logged-in user (activating a plugin, trashing a post and other GET actions; any nonce parameter or the `X-WP-Nonce` header),
+- in a WP-CLI command (`ddev wp ...`), except read-only commands (`list`, `get`, `status`, ...) and `cron`, `transient`, `cache`, `rewrite flush`.
 
-Anonymous visitors, page views, logins, the heartbeat, screen options and statistics hits never count, whichever plugin writes. Each edit is one line in `.ddev/.wpdev/dirty` (`ddev wpdev edits show`, `ddev dbsync status`). Add project-specific noise with `WPDEV_DIRTY_IGNORE_EXTRA`, a regex matched against the signature shown there, e.g. `^POST /wp-admin/admin-ajax\.php action=my_plugin_ping$`.
+Anonymous visitors, page views, list filters and searches, logins, the heartbeat, screen options, transients and statistics hits never count, whichever plugin writes. Each edit is one line in `.ddev/.wpdev/dirty` (`ddev wpdev edits show`, `ddev dbsync status`). Add project-specific noise with `WPDEV_DIRTY_IGNORE_EXTRA`, a regex matched against the signature shown there, e.g. `^POST /wp-admin/admin-ajax\.php action=my_plugin_ping$`.
 
 In addition, the content hash covers the content tables only (posts, postmeta, terms, comments, links, WPML translation links; extend with `WPDEV_DB_HASH_CONTENT_TABLES`). It catches content changes made without WordPress, e.g. with direct SQL. Settings changed that way are invisible: record them with `ddev dbsync mark-dirty "what changed"`.
 
-Edits made while a commit exports the database are kept for the next snapshot; if an export fails, its edits stay recorded.
+Edits made while a commit exports the database are kept for the next snapshot; if an export fails, its edits stay recorded. If the edits or the hash cannot be read, the commit is stopped rather than passed without a snapshot.
+
+Edit recording needs the wp-devkit runtime in `wp-config.php` (automatic for the generated one, see [Custom wp-config.php](#custom-wp-configphp)). Without it, `ddev dbsync` warns and compares the full hash (`full-v1`) instead. Set `WPDEV_DB_CHANGE_DETECTION` and `WPDEV_DIRTY_IGNORE_EXTRA` in `.ddev/.env` (not `.env.local`: WordPress does not see it) and run `ddev restart` after changing them.
 
 `WPDEV_DB_CHANGE_DETECTION=hash` restores the previous behaviour: no edit recording, the hash covers every table minus known noise (`WPDEV_DB_HASH_SKIP_*`), and every plugin that writes in the background needs its own exclusion.
 

@@ -38,7 +38,13 @@ env_get() {
 REMOTE="$(env_get WPDEV_DB_REMOTE)"
 REMOTE="${REMOTE%/}"
 
-CHANGE_DETECTION="$(env_get WPDEV_DB_CHANGE_DETECTION)"
+# Settings that WordPress reads too must be in .ddev/.env: DDEV does not pass
+# .ddev/.env.local into the container, so host and PHP would disagree.
+for key in WPDEV_DB_CHANGE_DETECTION WPDEV_DIRTY_IGNORE_EXTRA; do
+  [ -f "${APPROOT}/.ddev/.env.local" ] && grep -qE "^${key}=" "${APPROOT}/.ddev/.env.local" \
+    && warn "${key} in .ddev/.env.local is ignored; set it in .ddev/.env (WordPress does not see .env.local)."
+done
+CHANGE_DETECTION="$(grep -E '^WPDEV_DB_CHANGE_DETECTION=' "${APPROOT}/.ddev/.env" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' || true)"
 CHANGE_DETECTION="${CHANGE_DETECTION:-edits}"
 [[ "${CHANGE_DETECTION}" =~ ^(edits|hash)$ ]] || die "WPDEV_DB_CHANGE_DETECTION must be 'edits' or 'hash', not '${CHANGE_DETECTION}'."
 if [ "${CHANGE_DETECTION}" = "hash" ]; then POLICY="full-v1"; else POLICY="content-v1"; fi
@@ -89,8 +95,23 @@ ddev_running() {
   ddev describe -j 2>/dev/null | python3 -I -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["raw"]["status"] == "running" else 1)'
 }
 
+SKIP_HINT=" (Commit without database check: WPDEV_DB_SKIP=1 git commit ...)"
+
+# Prints the content hash, "empty" (no WordPress database) or "unknown-policy".
+# Exits on any other failure: an unknown state must never pass as "unchanged".
 current_hash() { # [policy]
-  ddev wpdev hash --policy "${1:-${POLICY}}" 2>/dev/null | tail -1
+  local policy="${1:-${POLICY}}" out
+  if ! out="$(ddev wpdev hash --policy "${policy}" 2>&1)"; then
+    if [[ "${out}" == *"Unknown hash policy"* ]]; then
+      warn "A snapshot uses hash policy '${policy}' from a newer wp-devkit. Update wp-devkit; until then every commit exports a snapshot."
+      echo "unknown-policy"
+      return 0
+    fi
+    die "Could not compute the database hash: $(printf '%s' "${out}" | tail -1)${SKIP_HINT}"
+  fi
+  out="$(printf '%s' "${out}" | tail -1)"
+  [[ "${out}" =~ ^([0-9a-f]{32}|empty)$ ]] || die "Unexpected database hash: '${out}'${SKIP_HINT}"
+  echo "${out}"
 }
 
 ensure_cache_dir() {
@@ -107,14 +128,28 @@ write_state() { # file content_hash
 # edits"), never read them from the host: with Mutagen the host copy lags behind.
 edits() { ddev wpdev edits "$@"; }
 
-edit_count() {
-  [ "${CHANGE_DETECTION}" = "edits" ] || { echo 0; return 0; }
-  local n
-  n="$(edits count 2>/dev/null || true)"
-  [[ "${n}" =~ ^[0-9]+$ ]] && echo "${n}" || echo 0
+# Read once per run: is edit recording active, and how many edits are recorded?
+# Without recording (custom wp-config.php that does not load wp-devkit, or a
+# container not restarted after a mode change), the content hash cannot see
+# settings: fall back to the full hash.
+RECORDING=""
+EDIT_COUNT=0
+load_edit_state() {
+  [ -z "${RECORDING}" ] || return 0
+  if [ "${CHANGE_DETECTION}" != "edits" ]; then RECORDING="off"; return 0; fi
+  local out
+  out="$(edits state 2>/dev/null | tail -1)" || true
+  [[ "${out}" =~ ^(on|off)\ ([0-9]+)$ ]] || die "Could not read the recorded edits ('ddev wpdev edits state': '${out}').${SKIP_HINT}"
+  RECORDING="${BASH_REMATCH[1]}"
+  EDIT_COUNT="${BASH_REMATCH[2]}"
+  if [ "${RECORDING}" = "off" ]; then
+    warn "Edit recording is not active: wp-config.php does not load wp-devkit, or DDEV needs a restart after changing WPDEV_DB_CHANGE_DETECTION."
+    warn "Comparing the full database hash (full-v1) instead."
+    POLICY="full-v1"
+  fi
 }
 
-has_edits() { [ "$(edit_count)" -gt 0 ]; }
+has_edits() { load_edit_state; [ "${EDIT_COUNT}" -gt 0 ]; }
 
 edit_summary() { edits show 3 | sed 's/^/dbsync:   /'; }
 
@@ -125,9 +160,12 @@ edit_summary() { edits show 3 | sed 's/^/dbsync:   /'; }
 # database, so it counts as changed until a full-v1 snapshot exists.
 hash_differs() { # content_hash policy
   [ -n "$1" ] || return 1
-  local policy="${2:-${LEGACY_POLICY}}"
-  [ "${CHANGE_DETECTION}" = "hash" ] && [ "${policy}" != "full-v1" ] && return 0
-  [ "$(current_hash "${policy}")" != "$1" ]
+  local policy="${2:-${LEGACY_POLICY}}" now
+  load_edit_state
+  [ "${RECORDING}" != "on" ] && [ "${policy}" != "full-v1" ] && return 0
+  # Explicit exit: this runs in conditions, where set -e does not apply.
+  now="$(current_hash "${policy}")" || exit 1
+  [ "${now}" != "$1" ]
 }
 
 # Local changes that are not in the loaded snapshot: recorded edits or a changed hash.
@@ -165,6 +203,7 @@ cmd_pull() {
   fi
 
   # Never silently overwrite local changes.
+  load_edit_state
   if [ "${force}" != "--force" ] && has_local_changes; then
     warn "Your local database has changes that are not in any snapshot."
     has_edits && edit_summary >&2
@@ -186,7 +225,9 @@ cmd_pull() {
   info "Importing ${file} ..."
   ddev import-db --file="${local_file}" >/dev/null
   edits clear
-  write_state "${file}" "$(current_hash)"
+  local loaded_hash
+  loaded_hash="$(current_hash)"
+  write_state "${file}" "${loaded_hash}"
   info "Database is now ${file}."
 }
 
@@ -194,14 +235,14 @@ cmd_pull() {
 # pointer. Used by pre-commit.
 cmd_push() {
   ddev_running || { warn "DDEV is not running, database not checked. Start DDEV and commit again if you changed content."; return 0; }
+  load_edit_state
   local now_hash
   now_hash="$(current_hash)"
-  [ -n "${now_hash}" ] && [ "${now_hash}" != "empty" ] || { info "No WordPress database, nothing to push."; return 0; }
+  [ "${now_hash}" != "empty" ] || { info "No WordPress database, nothing to push."; return 0; }
 
   # Compare with the pointer that is about to be committed (index), using the
   # hash policy that pointer was written with.
-  local staged parent="" edited
-  edited="$(edit_count)"
+  local staged parent="" edited="${EDIT_COUNT}"
   staged="$(git -C "${APPROOT}" show ":${POINTER_REL}" 2>/dev/null || true)"
   if [ -n "${staged}" ]; then
     parent="$(printf '%s' "${staged}" | json_get_stdin file)"
@@ -296,6 +337,10 @@ cmd_resolve() {
   local other="theirs"; [ "${side}" = "theirs" ] && other="ours"
   local other_json
   other_json="$(git -C "${APPROOT}" show ":$([ "${other}" = "ours" ] && echo 2 || echo 3):${POINTER_REL}" 2>/dev/null || true)"
+  if ddev_running && has_edits; then
+    warn "Discarding ${EDIT_COUNT} recorded edit(s) of the local database, latest:"
+    edit_summary >&2
+  fi
   git -C "${APPROOT}" checkout "--${side}" -- "${POINTER_REL}"
   git -C "${APPROOT}" add "${POINTER_REL}"
   cmd_pull --force
@@ -318,9 +363,9 @@ cmd_status() {
     echo "Pointer:         none (${POINTER_REL} missing)"
   fi
   echo "Loaded locally:  $(json_get "${STATE}" file)"
-  echo "Detection:       ${CHANGE_DETECTION} (hash policy ${POLICY})"
   local edited=0
-  ddev_running && edited="$(edit_count)"
+  if ddev_running; then load_edit_state; edited="${EDIT_COUNT}"; fi
+  echo "Detection:       ${CHANGE_DETECTION} (hash policy ${POLICY}$([ "${RECORDING}" = "off" ] && [ "${CHANGE_DETECTION}" = "edits" ] && echo ", recording NOT active"))"
   if [ "${edited}" -gt 0 ]; then
     echo "Local changes:   YES, ${edited} recorded edit(s) (exported on next commit), latest:"
     edit_summary
