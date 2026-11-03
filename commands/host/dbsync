@@ -120,9 +120,14 @@ edit_summary() { edits show 3 | sed 's/^/dbsync:   /'; }
 
 # Does the database differ from a snapshot with this hash? Compares with the
 # snapshot's own hash policy; "" (no hash known) counts as unknown, not as changed.
+# A content-v1 hash only sees content tables; settings were covered by recorded
+# edits. Without edit recording (mode "hash") it cannot vouch for an unchanged
+# database, so it counts as changed until a full-v1 snapshot exists.
 hash_differs() { # content_hash policy
   [ -n "$1" ] || return 1
-  [ "$(current_hash "${2:-${LEGACY_POLICY}}")" != "$1" ]
+  local policy="${2:-${LEGACY_POLICY}}"
+  [ "${CHANGE_DETECTION}" = "hash" ] && [ "${policy}" != "full-v1" ] && return 0
+  [ "$(current_hash "${policy}")" != "$1" ]
 }
 
 # Local changes that are not in the loaded snapshot: recorded edits or a changed hash.

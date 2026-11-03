@@ -234,10 +234,24 @@ $GLOBALS['wpdev_db_written'] = false;
 function wpdev_detect_writes( $query ) {
 	if ( ! $GLOBALS['wpdev_db_written']
 		&& preg_match( '/^\s*(INSERT|UPDATE|DELETE|REPLACE|ALTER|CREATE|DROP|TRUNCATE|RENAME)\b/i', $query )
-		&& ! preg_match( '/_(site_)?transient_/', $query ) ) {
+		&& ! wpdev_is_transient_write( $query ) ) {
 		$GLOBALS['wpdev_db_written'] = true;
 	}
 	return $query;
+}
+
+/**
+ * Writes that only set or expire transients (caches). Matches the option/meta
+ * key, not the value: saving a setting whose value contains "_transient_" counts.
+ */
+function wpdev_is_transient_write( $query ) {
+	// '_transient_', '_site_transient_', also LIKE-escaped by prepare(): '\\_transient\\_%'.
+	$key = '\'\\\\*_(site\\\\*_)?transient\\\\*_';
+	// add_option()/set_site_transient(): the key is the first value (sitemeta: after site_id).
+	$insert = '^\s*(INSERT|REPLACE)\s+(IGNORE\s+)?INTO\s+`?\w*(options|sitemeta)`?\s*\([^)]*\)\s*VALUES\s*\(\s*(\d+\s*,\s*)?' . $key;
+	// update_option(), delete_option(), delete_expired_transients(): the key is in WHERE.
+	$where = '^\s*(UPDATE|DELETE)\b.*\bWHERE\s+(\w+\.)?`?(option_name|meta_key)`?\s*(=|LIKE)\s*' . $key;
+	return (bool) preg_match( '/' . $insert . '|' . $where . '/is', $query );
 }
 
 /**
@@ -257,7 +271,16 @@ function wpdev_edit_signature() {
 	if ( $is_get && ! ( is_admin() && isset( $_REQUEST['_wpnonce'] ) ) ) {
 		return null;
 	}
-	$path      = (string) parse_url( isset( $_SERVER['REQUEST_URI'] ) ? $_SERVER['REQUEST_URI'] : '/', PHP_URL_PATH );
+	$path = (string) parse_url( isset( $_SERVER['REQUEST_URI'] ) ? $_SERVER['REQUEST_URI'] : '/', PHP_URL_PATH );
+	// Relative to the WordPress installation (core may live in a subdirectory), so
+	// "/wp-admin/..." patterns match everywhere.
+	foreach ( array( site_url(), home_url() ) as $base ) {
+		$base = rtrim( (string) parse_url( $base, PHP_URL_PATH ), '/' );
+		if ( '' !== $base && 0 === strpos( $path, $base . '/' ) ) {
+			$path = substr( $path, strlen( $base ) );
+			break;
+		}
+	}
 	$signature = $method . ' ' . $path;
 	if ( isset( $_GET['rest_route'] ) && is_string( $_GET['rest_route'] ) ) {
 		$signature = $method . ' /wp-json' . $_GET['rest_route'];

@@ -77,7 +77,7 @@ Edits made while a commit exports the database are kept for the next snapshot; i
 
 `WPDEV_DB_CHANGE_DETECTION=hash` restores the previous behaviour: no edit recording, the hash covers every table minus known noise (`WPDEV_DB_HASH_SKIP_*`), and every plugin that writes in the background needs its own exclusion.
 
-**Hash policies.** Every snapshot pointer stores the `hash_policy` its hash was computed with (`content-v1` for `edits`, `full-v1` for `hash`; pointers without it are `full-v1`). wp-devkit only compares hashes computed with the same policy, so upgrading or switching the mode never produces a spurious snapshot and never hides a change. Upgrade wp-devkit for the whole team at once: older versions do not know about policies and export a snapshot on every commit after a newer version wrote a pointer.
+**Hash policies.** Every snapshot pointer stores the `hash_policy` its hash was computed with (`content-v1` for `edits`, `full-v1` for `hash`; pointers without it are `full-v1`). wp-devkit only compares hashes computed with the same policy, so upgrading or switching the mode never produces a spurious snapshot and never hides a change. After switching from `edits` to `hash`, the next commit exports a `full-v1` snapshot once: a `content-v1` hash cannot vouch for unchanged settings. Upgrade wp-devkit for the whole team at once: older versions do not know about policies and export a snapshot on every commit after a newer version wrote a pointer.
 
 ```bash
 ddev dbsync status | pull [--force] | push | resolve ours|theirs

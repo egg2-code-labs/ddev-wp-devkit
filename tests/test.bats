@@ -175,6 +175,15 @@ edit_detection_checks() {
   run ddev wp option get blogname
   refute_output "Edited"
 
+  # Transients are caches, not edits; a setting whose value merely contains "_transient_" is one
+  ddev wpdev edits clear
+  ddev wp eval 'set_transient("wpdev_a", 1, 60); delete_transient("wpdev_a");' >/dev/null
+  run edits_count
+  assert_output "0"
+  ddev wp eval 'update_option("wpdev_setting", "_transient_like_value");' >/dev/null
+  run edits_count
+  assert_output "1"
+
   # Changes wp-devkit cannot see are recorded by hand
   run ddev dbsync mark-dirty "direct SQL"
   assert_success
