@@ -231,8 +231,8 @@ const WPDEV_DIRTY_IGNORE = array(
 	'^POST /wp-json/\S*/hit$',
 	'^cli (cron|transient|cache)( |$)',
 	'^cli rewrite flush$',
-	'^cli (help|cli|info)( |$)',
-	'^cli \S+ (list|get|exists|is-installed|is-active|search|status|count|pluck|path|type|has|check-update|verify-checksums|version)( |$)',
+	'^cli (help|cli|info)$',
+	'^cli (\S+ )+(list|get|exists|is-installed|is-active|search|status|count|pluck|path|type|has|check-update|verify-checksums|version)$',
 );
 
 $GLOBALS['wpdev_db_written'] = false;
@@ -266,8 +266,7 @@ function wpdev_is_transient_write( $query ) {
  */
 function wpdev_edit_signature() {
 	if ( defined( 'WP_CLI' ) && WP_CLI ) {
-		$args = class_exists( 'WP_CLI' ) ? WP_CLI::get_runner()->arguments : array();
-		return 'cli ' . implode( ' ', array_slice( (array) $args, 0, 2 ) );
+		return 'cli ' . implode( ' ', wpdev_cli_command_path() );
 	}
 	if ( ! function_exists( 'is_user_logged_in' ) || ! is_user_logged_in() ) {
 		return null;
@@ -303,6 +302,27 @@ function wpdev_edit_signature() {
 		$signature .= ' action=' . $action;
 	}
 	return $signature;
+}
+
+/**
+ * The WP-CLI command without its arguments, e.g. array( 'post', 'meta', 'get' ) for
+ * "wp post meta get 1 key": arguments are data ("wp search-replace list lists").
+ */
+function wpdev_cli_command_path() {
+	if ( ! class_exists( 'WP_CLI' ) ) {
+		return array();
+	}
+	$args = (array) WP_CLI::get_runner()->arguments;
+	try {
+		$found = WP_CLI::get_runner()->find_command_to_run( $args );
+		if ( is_array( $found ) && isset( $found[2] ) && is_array( $found[2] ) ) {
+			return $found[2];
+		}
+	} catch ( Throwable $e ) {
+		// Fall through: older WP-CLI or unknown command.
+	}
+	// Only the top-level command: never mistake data for a read-only verb.
+	return array_slice( $args, 0, 1 );
 }
 
 // A nonce in any common form: _wpnonce, _ajax_nonce, nonce, my_plugin_nonce, X-WP-Nonce.

@@ -67,7 +67,7 @@ Plugins write to the database all the time (caches, counters, notices, update ch
 
 - in a non-GET request of a logged-in user (saving posts, settings, menus, media, page builders, REST/AJAX saves),
 - in an admin URL with a nonce opened by a logged-in user (activating a plugin, trashing a post and other GET actions; any nonce parameter or the `X-WP-Nonce` header),
-- in a WP-CLI command (`ddev wp ...`), except read-only commands (`list`, `get`, `status`, ...) and `cron`, `transient`, `cache`, `rewrite flush`.
+- in a WP-CLI command (`ddev wp ...`), except read-only commands (`list`, `get`, `status`, ... also nested like `wp post meta get`) and `cron`, `transient`, `cache`, `rewrite flush`.
 
 Anonymous visitors, page views, list filters and searches, logins, the heartbeat, screen options, transients and statistics hits never count, whichever plugin writes. Each edit is one line in `.ddev/.wpdev/dirty` (`ddev wpdev edits show`, `ddev dbsync status`). Add project-specific noise with `WPDEV_DIRTY_IGNORE_EXTRA`, a regex matched against the signature shown there, e.g. `^POST /wp-admin/admin-ajax\.php action=my_plugin_ping$`.
 
@@ -79,7 +79,7 @@ Edit recording needs the wp-devkit runtime in `wp-config.php` (automatic for the
 
 `WPDEV_DB_CHANGE_DETECTION=hash` restores the previous behaviour: no edit recording, the hash covers every table minus known noise (`WPDEV_DB_HASH_SKIP_*`), and every plugin that writes in the background needs its own exclusion.
 
-**Hash policies.** Every snapshot pointer stores the `hash_policy` its hash was computed with (`content-v1` for `edits`, `full-v1` for `hash`; pointers without it are `full-v1`). wp-devkit only compares hashes computed with the same policy, so upgrading or switching the mode never produces a spurious snapshot and never hides a change. After switching from `edits` to `hash`, the next commit exports a `full-v1` snapshot once: a `content-v1` hash cannot vouch for unchanged settings. Upgrade wp-devkit for the whole team at once: older versions do not know about policies and export a snapshot on every commit after a newer version wrote a pointer.
+**Hash policies.** Every snapshot pointer stores the `hash_policy` its hash was computed with (`content-v1` for `edits`, `full-v1` for `hash`). wp-devkit only compares hashes computed with the same policy, so switching the mode never hides a change. A hash it cannot compare counts as changed: after switching from `edits` to `hash` (a `content-v1` hash cannot vouch for unchanged settings) and for snapshots written by wp-devkit versions without hash policies, the next commit exports a new snapshot, and `pull` asks to commit or `--force` first. Upgrade wp-devkit for the whole team at once: older versions do not know about policies and export a snapshot on every commit after a newer version wrote a pointer.
 
 ```bash
 ddev dbsync status | pull [--force] | push | resolve ours|theirs
@@ -115,7 +115,8 @@ In `.ddev/.env` (committed), then `ddev restart`:
 | `WPDEV_DB_CHANGE_DETECTION` | `edits` | `edits`: record edits + content-table hash. `hash`: hash over all tables only (previous behaviour) |
 | `WPDEV_DIRTY_IGNORE_EXTRA` | empty | Regex: request signatures that are not edits (see `ddev wpdev edits show`) |
 | `WPDEV_DB_HASH_CONTENT_TABLES` | empty | Regex: additional tables for the content hash (mode `edits`) |
-| `WPDEV_DB_HASH_SKIP_TABLES` / `_OPTIONS` / `_META` | see `commands/web/wpdev` | Regex: what does not affect the content hash |
+| `WPDEV_DB_HASH_SKIP_TABLES` / `_OPTIONS` / `_META` | see `commands/web/wpdev` | Regex: what does not affect the content hash (replaces the default) |
+| `WPDEV_DB_HASH_SKIP_TABLES_EXTRA` / `_OPTIONS_EXTRA` / `_META_EXTRA` | empty | Regex: added to the defaults above, e.g. a plugin's view counter meta key |
 
 Project-specific PHP constants (e.g. dev license keys, WPML settings) go into `.ddev/wp-config-project.php`, which is loaded first.
 

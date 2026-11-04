@@ -208,7 +208,7 @@ PHP
   run ddev wpdev edits show 50
   assert_output --partial "manual direct SQL"
 
-  # The legacy policy still computes the hash of earlier wp-devkit versions
+  # The full-table policy (mode "hash") is available
   run ddev wpdev hash --policy full-v1
   assert_success
   assert_output --regexp '[0-9a-f]{32}'

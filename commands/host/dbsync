@@ -14,8 +14,6 @@ POINTER_REL="db/snapshot.json"
 POINTER="${APPROOT}/${POINTER_REL}"
 CACHE_DIR="${APPROOT}/.ddev/.wpdev"
 STATE="${CACHE_DIR}/state.json"
-# Snapshots and states written before hash policies existed use the old algorithm.
-LEGACY_POLICY="full-v1"
 HOOKS_REL=".ddev/wp-devkit/githooks"
 
 info() { echo "dbsync: $*"; }
@@ -119,9 +117,16 @@ ensure_cache_dir() {
   [ -f "${CACHE_DIR}/.gitignore" ] || echo '*' > "${CACHE_DIR}/.gitignore"
 }
 
-write_state() { # file content_hash
+write_state() { # file content_hash ("" = unknown)
   ensure_cache_dir
-  python3 -I -c 'import json,sys; json.dump({"file": sys.argv[2], "content_hash": sys.argv[3], "hash_policy": sys.argv[4]}, open(sys.argv[1], "w"), indent=2)' "${STATE}" "$1" "$2" "${POLICY}"
+  # Temp file + rename: an interrupted write must not leave a truncated state.
+  python3 -I -c 'import json,os,sys; json.dump({"file": sys.argv[2], "content_hash": sys.argv[3], "hash_policy": sys.argv[4]}, open(sys.argv[1] + ".tmp", "w"), indent=2); os.replace(sys.argv[1] + ".tmp", sys.argv[1])' "${STATE}" "$1" "$2" "${POLICY}"
+}
+
+# Read a key of state.json; exits if the file exists but cannot be parsed
+# (json_get's own failure would be swallowed in a command substitution argument).
+state_get() { # key
+  json_get "${STATE}" "$1" || die "Cannot read ${STATE#"${APPROOT}"/}. Delete it and run 'ddev dbsync pull --force'."
 }
 
 # Edits recorded by wp-config-devkit.php. They live in the container ("ddev wpdev
@@ -138,8 +143,8 @@ load_edit_state() {
   [ -z "${RECORDING}" ] || return 0
   if [ "${CHANGE_DETECTION}" != "edits" ]; then RECORDING="off"; return 0; fi
   local out
-  out="$(edits state 2>/dev/null | tail -1)" || true
-  [[ "${out}" =~ ^(on|off)\ ([0-9]+)$ ]] || die "Could not read the recorded edits ('ddev wpdev edits state': '${out}').${SKIP_HINT}"
+  out="$(edits state 2>&1)" || true
+  [[ "$(printf '%s' "${out}" | tail -1)" =~ ^(on|off)\ ([0-9]+)$ ]] || die "Could not read the recorded edits ('ddev wpdev edits state': $(printf '%s' "${out}" | tail -3 | tr '\n' ' ')).${SKIP_HINT}"
   RECORDING="${BASH_REMATCH[1]}"
   EDIT_COUNT="${BASH_REMATCH[2]}"
   if [ "${RECORDING}" = "off" ]; then
@@ -153,25 +158,43 @@ has_edits() { load_edit_state; [ "${EDIT_COUNT}" -gt 0 ]; }
 
 edit_summary() { edits show 3 | sed 's/^/dbsync:   /'; }
 
+# Can a snapshot hash be compared with the local database? Not without its policy
+# (written by an earlier wp-devkit), and not a content-v1 hash without edit
+# recording: it only sees content tables, settings were covered by the edits.
+hash_comparable() { # policy
+  load_edit_state
+  [ -n "$1" ] || return 1
+  [ "${RECORDING}" = "on" ] || [ "$1" = "full-v1" ]
+}
+
 # Does the database differ from a snapshot with this hash? Compares with the
 # snapshot's own hash policy; "" (no hash known) counts as unknown, not as changed.
-# A content-v1 hash only sees content tables; settings were covered by recorded
-# edits. Without edit recording (mode "hash") it cannot vouch for an unchanged
-# database, so it counts as changed until a full-v1 snapshot exists.
+# A hash that cannot be compared counts as changed, until a new snapshot exists.
 hash_differs() { # content_hash policy
   [ -n "$1" ] || return 1
-  local policy="${2:-${LEGACY_POLICY}}" now
-  load_edit_state
-  [ "${RECORDING}" != "on" ] && [ "${policy}" != "full-v1" ] && return 0
+  hash_comparable "$2" || return 0
+  local now
   # Explicit exit: this runs in conditions, where set -e does not apply.
-  now="$(current_hash "${policy}")" || exit 1
+  now="$(current_hash "$2")" || exit 1
   [ "${now}" != "$1" ]
+}
+
+# The loaded snapshot cannot be compared with the local database (see hash_comparable).
+state_unverifiable() {
+  load_edit_state
+  local hash policy
+  hash="$(state_get content_hash)" || exit 1
+  policy="$(state_get hash_policy)" || exit 1
+  [ -n "${hash}" ] && ! hash_comparable "${policy}"
 }
 
 # Local changes that are not in the loaded snapshot: recorded edits or a changed hash.
 has_local_changes() {
   has_edits && return 0
-  hash_differs "$(json_get "${STATE}" content_hash)" "$(json_get "${STATE}" hash_policy)"
+  local hash policy
+  hash="$(state_get content_hash)" || exit 1
+  policy="$(state_get hash_policy)" || exit 1
+  hash_differs "${hash}" "${policy}"
 }
 
 pointer_conflicted() { [ -f "${POINTER}" ] && grep -q '^<<<<<<<' "${POINTER}"; }
@@ -197,13 +220,21 @@ cmd_pull() {
   content_hash="$(json_get "${POINTER}" content_hash)"
   [ -n "${file}" ] || die "${POINTER_REL} has no 'file' (merge conflict?). Resolve it first, see README."
 
-  if [ "$(json_get "${STATE}" file)" = "${file}" ] && [ "${force}" != "--force" ]; then
+  local loaded_file
+  loaded_file="$(state_get file)"
+  if [ "${loaded_file}" = "${file}" ] && [ "${force}" != "--force" ]; then
     info "Database is up to date (${file})."
     return 0
   fi
 
   # Never silently overwrite local changes.
   load_edit_state
+  if [ "${force}" != "--force" ] && ! has_edits && state_unverifiable; then
+    warn "Cannot check the local database for changes: the loaded snapshot was written by an earlier"
+    warn "wp-devkit, or edit recording is not active. NOT importing ${file}."
+    warn "Commit first (exports a new snapshot) or discard local changes with: ddev dbsync pull --force"
+    return 0
+  fi
   if [ "${force}" != "--force" ] && has_local_changes; then
     warn "Your local database has changes that are not in any snapshot."
     has_edits && edit_summary >&2
@@ -224,6 +255,9 @@ cmd_pull() {
 
   info "Importing ${file} ..."
   ddev import-db --file="${local_file}" >/dev/null
+  # Record the import before anything else can fail: an unknown hash is safe,
+  # a state still naming the previous snapshot would block the next pull.
+  write_state "${file}" ""
   edits clear
   local loaded_hash
   loaded_hash="$(current_hash)"
@@ -250,7 +284,6 @@ cmd_push() {
       local staged_hash staged_policy
       staged_hash="$(printf '%s' "${staged}" | json_get_stdin content_hash)"
       staged_policy="$(printf '%s' "${staged}" | json_get_stdin hash_policy)"
-      staged_policy="${staged_policy:-${LEGACY_POLICY}}"
       if [ "${staged_policy}" = "${POLICY}" ]; then
         [ "${staged_hash}" = "${now_hash}" ] && return 0
       else
@@ -316,9 +349,16 @@ cmd_init() {
 
 record_edit() { # signature
   local user
-  user="$(git -C "${APPROOT}" config user.name | tr -cs 'A-Za-z0-9._-' '-' | sed 's/-*$//' || true)"
-  # Plain words only: the arguments pass through a shell inside the container.
-  edits add "${user:-unknown}" $(printf '%s' "$1" | tr -cs 'A-Za-z0-9._:/@-' ' ')
+  user="$(git -C "${APPROOT}" config user.name | tr -cs 'A-Za-z0-9._-' '-' | sed 's/^-*//;s/-*$//' || true)"
+  # Plain words only: the arguments pass through a shell inside the container,
+  # and a leading "-" would be read as a ddev flag.
+  local word words=()
+  for word in $(printf '%s' "$1" | tr -cs 'A-Za-z0-9._:/@-' ' '); do
+    word="${word#"${word%%[!-]*}"}"
+    [ -z "${word}" ] || words+=( "${word}" )
+  done
+  [ "${#words[@]}" -gt 0 ] || words=( "note" )
+  edits add "${user:-unknown}" "${words[@]}"
 }
 
 # For changes wp-devkit cannot see: direct SQL, "wp db query", database GUIs.
@@ -362,7 +402,9 @@ cmd_status() {
   else
     echo "Pointer:         none (${POINTER_REL} missing)"
   fi
-  echo "Loaded locally:  $(json_get "${STATE}" file)"
+  local loaded_file
+  loaded_file="$(state_get file)"
+  echo "Loaded locally:  ${loaded_file}"
   local edited=0
   if ddev_running; then load_edit_state; edited="${EDIT_COUNT}"; fi
   echo "Detection:       ${CHANGE_DETECTION} (hash policy ${POLICY}$([ "${RECORDING}" = "off" ] && [ "${CHANGE_DETECTION}" = "edits" ] && echo ", recording NOT active"))"
@@ -370,10 +412,12 @@ cmd_status() {
     echo "Local changes:   YES, ${edited} recorded edit(s) (exported on next commit), latest:"
     edit_summary
   elif ddev_running; then
-    local loaded
-    loaded="$(json_get "${STATE}" content_hash)"
+    local loaded loaded_policy
+    loaded="$(state_get content_hash)"
+    loaded_policy="$(state_get hash_policy)"
     if [ -z "${loaded}" ]; then echo "Local changes:   unknown (no snapshot loaded via dbsync)"
-    elif hash_differs "${loaded}" "$(json_get "${STATE}" hash_policy)"; then echo "Local changes:   YES, content hash changed (exported on next commit)"
+    elif state_unverifiable; then echo "Local changes:   unknown (snapshot from an earlier wp-devkit, or edit recording not active; the next commit exports a new snapshot)"
+    elif hash_differs "${loaded}" "${loaded_policy}"; then echo "Local changes:   YES, content hash changed (exported on next commit)"
     else echo "Local changes:   none"; fi
   else
     echo "Local changes:   DDEV not running"

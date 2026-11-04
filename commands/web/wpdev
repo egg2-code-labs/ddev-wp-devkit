@@ -197,7 +197,16 @@ EDITS_PUSHING="${EDITS}.pushing"
 
 edits_cat() {
   local f
-  for f in "${EDITS_PUSHING}".* "${EDITS}"; do [ ! -f "${f}" ] || cat "${f}"; done
+  for f in "${EDITS_PUSHING}".* "${EDITS}"; do
+    [ ! -e "${f}" ] || cat "${f}" || die "Cannot read recorded edits in ${f}."
+  done
+}
+
+# Number of recorded edits; fails (instead of printing 0) if they cannot be read.
+edits_count() {
+  local lines
+  lines="$(edits_cat)" || return 1
+  if [ -z "${lines}" ]; then echo 0; else printf '%s\n' "${lines}" | wc -l | tr -d ' '; fi
 }
 
 # Does WordPress load the runtime that records edits?
@@ -208,9 +217,11 @@ edits_recording() {
 
 cmd_edits() {
   case "${1:-count}" in
-    count) edits_cat | wc -l | tr -d ' ' ;;
+    count) edits_count ;;
     state) # "<on|off> <count>", read by ddev dbsync in one call
-      echo "$(edits_recording && echo on || echo off) $(edits_cat | wc -l | tr -d ' ')" ;;
+      local n
+      n="$(edits_count)" || exit 1
+      echo "$(edits_recording && echo on || echo off) ${n}" ;;
     show) edits_cat | tail -"${2:-3}" ;;
     add)
       mkdir -p "${EDITS%/*}"
@@ -257,8 +268,13 @@ cmd_hash() {
     [ -n "${WPDEV_DB_HASH_CONTENT_TABLES:-}" ] && only_re="${only_re}|${WPDEV_DB_HASH_CONTENT_TABLES}"
     skip_re="${WPDEV_DB_HASH_SKIP_TABLES:-}"
     opt_skip="${WPDEV_DB_HASH_SKIP_OPTIONS:-^(_site)?_transient_}"
-    meta_skip="${WPDEV_DB_HASH_SKIP_META:-^(_site)?_transient_|^_edit_lock$}"
+    # Edit locks and view counters that anonymous visitors update.
+    meta_skip="${WPDEV_DB_HASH_SKIP_META:-^(_site)?_transient_|^_edit_lock$|^_?(post_)?views?(_count)?$|^wpb_post_views_count$}"
   fi
+  # *_EXTRA add to the defaults instead of replacing them.
+  [ -z "${WPDEV_DB_HASH_SKIP_TABLES_EXTRA:-}" ] || skip_re="${skip_re:+${skip_re}|}${WPDEV_DB_HASH_SKIP_TABLES_EXTRA}"
+  [ -z "${WPDEV_DB_HASH_SKIP_OPTIONS_EXTRA:-}" ] || opt_skip="${opt_skip}|${WPDEV_DB_HASH_SKIP_OPTIONS_EXTRA}"
+  [ -z "${WPDEV_DB_HASH_SKIP_META_EXTRA:-}" ] || meta_skip="${meta_skip}|${WPDEV_DB_HASH_SKIP_META_EXTRA}"
 
   local t sql_parts=() q
   for t in $(sql "SHOW TABLES"); do
