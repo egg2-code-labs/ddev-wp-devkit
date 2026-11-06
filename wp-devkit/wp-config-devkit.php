@@ -196,3 +196,188 @@ wpdev_add_early_hook( 'phpmailer_init', 'wpdev_force_mailpit', PHP_INT_MAX );
 if ( wpdev_env_bool( 'WPDEV_DISABLE_CRON', true ) ) {
 	wpdev_add_early_hook( 'action_scheduler_allow_async_request_runner', '__return_false', PHP_INT_MAX );
 }
+
+/**
+ * Edit detection for "ddev dbsync" (WPDEV_DB_CHANGE_DETECTION=edits, the default).
+ *
+ * Plugins write to the database all the time (caches, counters, notices, update
+ * checks), so comparing database contents cannot tell real edits from noise
+ * without a rule per plugin. Instead, a database write counts as an edit when it
+ * happens in an edit context:
+ *
+ * - a logged-in user sends a non-GET request (saving a post, settings, media,
+ *   page builders, REST/AJAX saves), or
+ * - a logged-in user opens an admin URL with a nonce (activating a plugin,
+ *   trashing a post and other admin actions that use GET links), or
+ * - a WP-CLI command (except read-only commands and cron/transient/cache
+ *   housekeeping).
+ *
+ * Each edit appends one line to .ddev/.wpdev/dirty; the pre-commit hook exports
+ * the database when that file exists. Writes by anonymous visitors, by page
+ * views (GET) and by the WordPress heartbeat never count.
+ */
+const WPDEV_DIRTY_FILE = '/var/www/html/.ddev/.wpdev/dirty';
+
+// Request signatures ("METHOD /path action=..." or "cli <command>") that never count
+// as edits: login, heartbeat, screen options, list filters, statistics hits,
+// read-only and housekeeping WP-CLI commands.
+// Projects add their own with WPDEV_DIRTY_IGNORE_EXTRA (one regex).
+const WPDEV_DIRTY_IGNORE = array(
+	'^[A-Z]+ /wp-login\.php',
+	'^POST /wp-admin/admin-ajax\.php action=(heartbeat|wp-remove-post-lock|closed-postboxes|meta-box-order|hidden-columns|dismiss-wp-pointer)$',
+	'^POST \S+ screen-options$',
+	'^GET \S+ action=-1$',
+	'/wp-statistics/',
+	'^POST /wp-json/\S*/hit$',
+	'^cli (cron|transient|cache)( |$)',
+	'^cli rewrite flush$',
+	'^cli (help|cli|info)$',
+	'^cli (\S+ )+(list|get|exists|is-installed|is-active|search|status|count|pluck|path|type|has|check-update|verify-checksums|version)$',
+);
+
+$GLOBALS['wpdev_db_written'] = false;
+
+function wpdev_detect_writes( $query ) {
+	if ( ! $GLOBALS['wpdev_db_written']
+		&& preg_match( '/^\s*(INSERT|UPDATE|DELETE|REPLACE|ALTER|CREATE|DROP|TRUNCATE|RENAME)\b/i', $query )
+		&& ! wpdev_is_transient_write( $query ) ) {
+		$GLOBALS['wpdev_db_written'] = true;
+	}
+	return $query;
+}
+
+/**
+ * Writes that only set or expire transients (caches). Matches the option/meta
+ * key, not the value: saving a setting whose value contains "_transient_" counts.
+ */
+function wpdev_is_transient_write( $query ) {
+	// '_transient_', '_site_transient_', also LIKE-escaped by prepare(): '\\_transient\\_%'.
+	$key = '\'\\\\*_(site\\\\*_)?transient\\\\*_';
+	// add_option()/set_site_transient(): the key is the first value (sitemeta: after site_id).
+	$insert = '^\s*(INSERT|REPLACE)\s+(IGNORE\s+)?INTO\s+`?\w*(options|sitemeta)`?\s*\([^)]*\)\s*VALUES\s*\(\s*(\d+\s*,\s*)?' . $key;
+	// update_option(), delete_option(), delete_expired_transients(): the key is in WHERE.
+	$where = '^\s*(UPDATE|DELETE)\b.*\bWHERE\s+(\w+\.)?`?(option_name|meta_key)`?\s*(=|LIKE)\s*' . $key;
+	return (bool) preg_match( '/' . $insert . '|' . $where . '/is', $query );
+}
+
+/**
+ * Describe the current request, e.g. "POST /wp-admin/post.php action=editpost"
+ * or "cli post update". Returns null outside an edit context.
+ */
+function wpdev_edit_signature() {
+	if ( defined( 'WP_CLI' ) && WP_CLI ) {
+		return 'cli ' . implode( ' ', wpdev_cli_command_path() );
+	}
+	if ( ! function_exists( 'is_user_logged_in' ) || ! is_user_logged_in() ) {
+		return null;
+	}
+	$method = isset( $_SERVER['REQUEST_METHOD'] ) ? strtoupper( $_SERVER['REQUEST_METHOD'] ) : 'GET';
+	$is_get = in_array( $method, array( 'GET', 'HEAD', 'OPTIONS' ), true );
+	if ( $is_get && ! ( is_admin() && wpdev_has_nonce() ) ) {
+		return null;
+	}
+	$path = (string) parse_url( isset( $_SERVER['REQUEST_URI'] ) ? $_SERVER['REQUEST_URI'] : '/', PHP_URL_PATH );
+	// Relative to the WordPress installation (core may live in a subdirectory), so
+	// "/wp-admin/..." patterns match everywhere.
+	foreach ( array( site_url(), home_url() ) as $base ) {
+		$base = rtrim( (string) parse_url( $base, PHP_URL_PATH ), '/' );
+		if ( '' !== $base && 0 === strpos( $path, $base . '/' ) ) {
+			$path = substr( $path, strlen( $base ) );
+			break;
+		}
+	}
+	$signature = $method . ' ' . $path;
+	if ( isset( $_GET['rest_route'] ) && is_string( $_GET['rest_route'] ) ) {
+		$signature = $method . ' /wp-json' . $_GET['rest_route'];
+	}
+	if ( isset( $_POST['wp_screen_options'] ) ) {
+		return $signature . ' screen-options';
+	}
+	// List tables send both dropdowns; "-1" means none (a filter or search).
+	$action = isset( $_REQUEST['action'] ) && is_string( $_REQUEST['action'] ) ? $_REQUEST['action'] : null;
+	if ( ( null === $action || '-1' === $action ) && isset( $_REQUEST['action2'] ) && is_string( $_REQUEST['action2'] ) ) {
+		$action = $_REQUEST['action2'];
+	}
+	if ( null !== $action ) {
+		$signature .= ' action=' . $action;
+	}
+	return $signature;
+}
+
+/**
+ * The WP-CLI command without its arguments, e.g. array( 'post', 'meta', 'get' ) for
+ * "wp post meta get 1 key": arguments are data ("wp search-replace list lists").
+ */
+function wpdev_cli_command_path() {
+	if ( ! class_exists( 'WP_CLI' ) ) {
+		return array();
+	}
+	$args = (array) WP_CLI::get_runner()->arguments;
+	try {
+		$found = WP_CLI::get_runner()->find_command_to_run( $args );
+		if ( is_array( $found ) && isset( $found[2] ) && is_array( $found[2] ) ) {
+			return $found[2];
+		}
+	} catch ( Throwable $e ) {
+		// Fall through: older WP-CLI or unknown command.
+	}
+	// Only the top-level command: never mistake data for a read-only verb.
+	return array_slice( $args, 0, 1 );
+}
+
+// A nonce in any common form: _wpnonce, _ajax_nonce, nonce, my_plugin_nonce, X-WP-Nonce.
+function wpdev_has_nonce() {
+	if ( ! empty( $_SERVER['HTTP_X_WP_NONCE'] ) ) {
+		return true;
+	}
+	foreach ( array_keys( $_REQUEST ) as $key ) {
+		if ( false !== stripos( (string) $key, 'nonce' ) ) {
+			return true;
+		}
+	}
+	return false;
+}
+
+function wpdev_record_edit() {
+	static $done = false, $deferred = false;
+	if ( $done ) {
+		return;
+	}
+	if ( ! $GLOBALS['wpdev_db_written'] ) {
+		// Plugins may write in their own shutdown functions, registered after
+		// WordPress' shutdown hook: check once more at the very end.
+		if ( ! $deferred ) {
+			$deferred = true;
+			register_shutdown_function( 'wpdev_record_edit' );
+		}
+		return;
+	}
+	$done      = true;
+	$signature = wpdev_edit_signature();
+	if ( null === $signature ) {
+		return;
+	}
+	// One printable line: request data must not break the file or the terminal.
+	$signature = substr( preg_replace( '/[^\x20-\x7e]+/', '?', $signature ), 0, 200 );
+	foreach ( array_filter( array_merge( WPDEV_DIRTY_IGNORE, array( wpdev_env( 'WPDEV_DIRTY_IGNORE_EXTRA' ) ) ) ) as $pattern ) {
+		if ( @preg_match( '#' . str_replace( '#', '\#', $pattern ) . '#', $signature ) ) {
+			return;
+		}
+	}
+	$dir = dirname( WPDEV_DIRTY_FILE );
+	if ( ! is_dir( $dir ) ) {
+		@mkdir( $dir, 0775, true );
+		@file_put_contents( $dir . '/.gitignore', "*\n" );
+	}
+	$user = function_exists( 'wp_get_current_user' ) ? preg_replace( '/[^\x20-\x7e]+/', '?', wp_get_current_user()->user_login ) : '';
+	@file_put_contents(
+		WPDEV_DIRTY_FILE,
+		gmdate( 'Y-m-d\TH:i:s\Z' ) . "\t" . $signature . ( $user ? "\t" . $user : '' ) . "\n",
+		FILE_APPEND | LOCK_EX
+	);
+}
+
+if ( 'edits' === wpdev_env( 'WPDEV_DB_CHANGE_DETECTION', 'edits' ) && ! wpdev_env_bool( 'WPDEV_NO_DIRTY', false ) ) {
+	wpdev_add_early_hook( 'query', 'wpdev_detect_writes', PHP_INT_MAX );
+	wpdev_add_early_hook( 'shutdown', 'wpdev_record_edit', PHP_INT_MAX, 0 );
+}

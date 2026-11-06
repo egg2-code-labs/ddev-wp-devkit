@@ -87,6 +87,133 @@ health_checks() {
   assert_output "200"
 }
 
+# HTTP request from inside the web container (cookie jar in /tmp/jar), prints the status code.
+web() {
+  ddev exec "curl -sk -c /tmp/jar -b /tmp/jar -o /dev/null -w '%{http_code}' $*"
+}
+
+edits_count() {
+  ddev wpdev edits count
+}
+
+edit_detection_checks() {
+  local url="https://${PROJNAME}.ddev.site"
+
+  # Database sharing via a local folder, git hooks active
+  echo "WPDEV_DB_REMOTE=${TESTDIR}/remote" > .ddev/.env.local
+  printf 'wp-config.php\n.ddev/.env.local\nwp-latest.tar.gz\n' > .gitignore
+  git init -q -b main
+  git config user.name "Test Dev"
+  git config user.email test@example.test
+  run ddev dbsync install-hooks
+  assert_success
+
+  # WP-CLI writes count as edits ("wp core install" above)
+  run ddev wpdev edits show 50
+  assert_output --partial "cli core install"
+
+  # The first commit exports a snapshot with the content-v1 hash policy and clears the edits
+  run git add -A
+  run git commit -qm "initial"
+  assert_success
+  assert_file_exists db/snapshot.json
+  run grep '"hash_policy": "content-v1"' db/snapshot.json
+  assert_success
+  run edits_count
+  assert_output "0"
+
+  # Noise is not an edit: WP-CLI housekeeping, anonymous visitors, login, admin page views, heartbeat
+  ddev wp transient set wpdev_test 1 >/dev/null
+  web "${url}/" >/dev/null
+  web "${url}/wp-login.php" >/dev/null
+  run web -d "'log=instadmin&pwd=instadmin&wp-submit=Log+In&testcookie=1'" "${url}/wp-login.php"
+  assert_output "302"
+  web "${url}/wp-admin/" >/dev/null
+  web -d "'action=heartbeat&interval=60&_nonce=x'" "${url}/wp-admin/admin-ajax.php" >/dev/null
+  run edits_count
+  assert_output "0"
+
+  # A commit without edits creates no snapshot
+  local pointer
+  pointer="$(cat db/snapshot.json)"
+  run git commit -q --allow-empty -m "no change"
+  assert_success
+  assert_equal "$(cat db/snapshot.json)" "${pointer}"
+
+  # Saving settings is an edit, although the content hash does not change
+  local hash_before nonce
+  hash_before="$(ddev wpdev hash | tail -1)"
+  nonce="$(ddev exec "curl -sk -b /tmp/jar ${url}/wp-admin/options-general.php" | grep -o 'name="_wpnonce" value="[^"]*"' | head -1 | sed 's/.*value="//;s/"//')"
+  run web -d "'option_page=general&action=update&_wpnonce=${nonce}&blogname=Edited&blogdescription=x&siteurl=${url}&home=${url}&new_admin_email=instadmin@example.test&timezone_string=UTC&date_format=Y-m-d&time_format=H:i&start_of_week=1&WPLANG='" "${url}/wp-admin/options.php"
+  assert_output "302"
+  run ddev wp option get blogname
+  assert_output "Edited"
+  run ddev wpdev edits show 50
+  assert_output --partial "POST /wp-admin/options.php action=update"
+  assert_equal "$(ddev wpdev hash | tail -1)" "${hash_before}"
+  run ddev dbsync status
+  assert_output --partial "Local changes:   YES"
+
+  run git commit -q --allow-empty -m "settings"
+  assert_success
+  refute [ "$(cat db/snapshot.json)" = "${pointer}" ]
+  run edits_count
+  assert_output "0"
+
+  # Recorded edits protect the local database: checking out the first commit does not import
+  ddev wp option update blogdescription "unsaved" >/dev/null
+  run git checkout -q HEAD~2
+  assert_output --partial "NOT importing"
+  run ddev wp option get blogdescription
+  assert_output "unsaved"
+
+  # pull --force discards them
+  run ddev dbsync pull --force
+  assert_success
+  run edits_count
+  assert_output "0"
+  run ddev wp option get blogname
+  refute_output "Edited"
+
+  # Transients are caches, not edits; a setting whose value merely contains "_transient_" is one
+  ddev wpdev edits clear
+  ddev wp eval 'set_transient("wpdev_a", 1, 60); delete_transient("wpdev_a");' >/dev/null
+  run edits_count
+  assert_output "0"
+  ddev wp eval 'update_option("wpdev_setting", "_transient_like_value");' >/dev/null
+  run edits_count
+  assert_output "1"
+
+  # A plugin that writes on every request (like SEO indexers): read-only WP-CLI commands,
+  # list filters and screen options stay quiet.
+  mkdir -p wp-content/mu-plugins
+  cat > wp-content/mu-plugins/wpdev-noise.php <<'PHP'
+<?php
+add_action( 'init', function () { update_option( 'wpdev_noise', microtime() ); } );
+PHP
+  ddev mutagen sync >/dev/null 2>&1 || true
+  ddev wpdev edits clear
+  ddev wp option get blogname >/dev/null
+  ddev wp post list >/dev/null
+  web "'${url}/wp-admin/edit.php?s=x&action=-1&_wpnonce=abc&action2=-1'" >/dev/null
+  web -d "'wp_screen_options[option]=edit_post_per_page&wp_screen_options[value]=50&screenoptionnonce=abc'" "${url}/wp-admin/edit.php" >/dev/null
+  run edits_count
+  assert_output "0"
+  rm wp-content/mu-plugins/wpdev-noise.php
+  ddev mutagen sync >/dev/null 2>&1 || true
+
+  # Changes wp-devkit cannot see are recorded by hand
+  run ddev dbsync mark-dirty "direct SQL"
+  assert_success
+  run ddev wpdev edits show 50
+  assert_output --partial "manual direct SQL"
+
+  # The full-table policy (mode "hash") is available
+  run ddev wpdev hash --policy full-v1
+  assert_success
+  assert_output --regexp '[0-9a-f]{32}'
+}
+
 teardown() {
   set -eu -o pipefail
   ddev delete -Oy "${PROJNAME}" >/dev/null 2>&1
@@ -107,6 +234,8 @@ teardown() {
   run ddev restart -y
   assert_success
   health_checks
+  # Not part of health_checks: the release test runs them against the published version.
+  edit_detection_checks
 }
 
 # bats test_tags=release
