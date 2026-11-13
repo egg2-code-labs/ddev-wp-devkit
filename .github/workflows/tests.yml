@@ -4,12 +4,12 @@ on:
     paths-ignore:
       - "**.md"
   push:
-    branches: [ main ]
+    branches: [main]
     paths-ignore:
       - "**.md"
 
   schedule:
-    - cron: '25 08 * * *'
+    - cron: "25 08 * * *"
 
   workflow_dispatch:
     inputs:
@@ -27,8 +27,6 @@ permissions:
   contents: read
 
 jobs:
-  # Primary: GitHub-hosted runner. Runs on every trusted ref and keeps CI green
-  # even when the self-hosted runner is offline.
   tests:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     strategy:
@@ -37,29 +35,6 @@ jobs:
       fail-fast: false
 
     runs-on: ubuntu-latest
-
-    steps:
-      - uses: ddev/github-action-add-on-test@v2
-        with:
-          ddev_version: ${{ matrix.ddev_version }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-          debug_enabled: ${{ github.event.inputs.debug_enabled }}
-          addon_repository: ${{ env.GITHUB_REPOSITORY }}
-          addon_ref: ${{ env.GITHUB_REF }}
-
-  # Secondary: self-hosted runner (faster, pre-warmed). Its failures do not
-  # block the hosted job; it confirms macOS/Apple-Silicon-like behaviour.
-  tests-selfhosted:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    strategy:
-      matrix:
-        ddev_version: [stable]
-      fail-fast: false
-
-    # Self-hosted runner prerequisites (expected by ddev/github-action-add-on-test):
-    # Docker, ddev, git, curl, python3, jq and the bats libraries
-    # (bats-core, bats-assert, bats-file, bats-support) on the runner's bats lib path.
-    runs-on: self-hosted
 
     steps:
       - uses: ddev/github-action-add-on-test@v2
