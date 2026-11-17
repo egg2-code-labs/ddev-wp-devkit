@@ -191,11 +191,13 @@ edit_detection_checks() {
 <?php
 add_action( 'init', function () { update_option( 'wpdev_noise', microtime() ); } );
 PHP
+  printf '<?php echo count( get_posts() );\n' > wpdev-read.php
   ddev mutagen sync >/dev/null 2>&1 || true
   ddev wpdev edits clear
   ddev wp option get blogname >/dev/null
   ddev wp post list >/dev/null
   ddev wp eval 'echo get_option("blogname");' >/dev/null
+  ddev wp eval-file wpdev-read.php >/dev/null
   web "'${url}/wp-admin/edit.php?s=x&action=-1&_wpnonce=abc&action2=-1'" >/dev/null
   web -d "'wp_screen_options[option]=edit_post_per_page&wp_screen_options[value]=50&screenoptionnonce=abc'" "${url}/wp-admin/edit.php" >/dev/null
   run edits_count
@@ -205,7 +207,13 @@ PHP
   run ddev wpdev edits show 50
   assert_output --partial "cli eval"
   ddev wpdev edits clear
-  rm wp-content/mu-plugins/wpdev-noise.php
+  # ... also when it runs on a WordPress hook before wp_loaded (WP-CLI versions with --hook)
+  if ddev wp eval 'update_option("wpdev_hook_write", 1);' --hook=init >/dev/null 2>&1; then
+    run edits_count
+    assert_output "1"
+    ddev wpdev edits clear
+  fi
+  rm wp-content/mu-plugins/wpdev-noise.php wpdev-read.php
   ddev mutagen sync >/dev/null 2>&1 || true
 
   # Changes wp-devkit cannot see are recorded by hand

@@ -382,8 +382,15 @@ function wpdev_record_edit() {
  * come from plugins (caches, notices, update checks), not from the command:
  * forget them, so "wp eval" that only reads is not an edit. If wp_loaded never
  * fires, every write still counts.
+ *
+ * Not with --hook (eval, eval-file in newer WP-CLI): the command's own code
+ * then runs on that WordPress hook, possibly before wp_loaded.
  */
 function wpdev_forget_bootstrap_writes() {
+	$assoc_args = class_exists( 'WP_CLI' ) ? (array) WP_CLI::get_runner()->assoc_args : array();
+	if ( isset( $assoc_args['hook'] ) ) {
+		return;
+	}
 	$GLOBALS['wpdev_db_written'] = false;
 }
 
