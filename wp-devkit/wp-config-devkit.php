@@ -377,7 +377,20 @@ function wpdev_record_edit() {
 	);
 }
 
+/**
+ * WP-CLI runs the command after WordPress has loaded. Writes while it loads
+ * come from plugins (caches, notices, update checks), not from the command:
+ * forget them, so "wp eval" that only reads is not an edit. If wp_loaded never
+ * fires, every write still counts.
+ */
+function wpdev_forget_bootstrap_writes() {
+	$GLOBALS['wpdev_db_written'] = false;
+}
+
 if ( 'edits' === wpdev_env( 'WPDEV_DB_CHANGE_DETECTION', 'edits' ) && ! wpdev_env_bool( 'WPDEV_NO_DIRTY', false ) ) {
 	wpdev_add_early_hook( 'query', 'wpdev_detect_writes', PHP_INT_MAX );
 	wpdev_add_early_hook( 'shutdown', 'wpdev_record_edit', PHP_INT_MAX, 0 );
+	if ( defined( 'WP_CLI' ) && WP_CLI ) {
+		wpdev_add_early_hook( 'wp_loaded', 'wpdev_forget_bootstrap_writes', PHP_INT_MAX, 0 );
+	}
 }

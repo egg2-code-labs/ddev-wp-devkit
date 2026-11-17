@@ -67,7 +67,7 @@ Plugins write to the database all the time (caches, counters, notices, update ch
 
 - in a non-GET request of a logged-in user (saving posts, settings, menus, media, page builders, REST/AJAX saves),
 - in an admin URL with a nonce opened by a logged-in user (activating a plugin, trashing a post and other GET actions; any parameter whose name contains "nonce", or the `X-WP-Nonce` header),
-- in a WP-CLI command (`ddev wp ...`), except read-only commands (`list`, `get`, `status`, ... also nested like `wp post meta get`) and `cron`, `transient`, `cache`, `rewrite flush`.
+- in a WP-CLI command (`ddev wp ...`), except read-only commands (`list`, `get`, `status`, ... also nested like `wp post meta get`) and `cron`, `transient`, `cache`, `rewrite flush`. Only writes by the command itself count, not writes of plugins while WordPress loads: `wp eval` / `eval-file` that only read are not edits.
 
 Anonymous visitors, page views, list filters and searches, logins, the heartbeat, screen options, transients and statistics hits never count, whichever plugin writes. Each edit is one line in `.ddev/.wpdev/dirty` (`ddev wpdev edits show`, `ddev dbsync status`). Add project-specific noise with `WPDEV_DIRTY_IGNORE_EXTRA`, a regex matched against the signature shown there, e.g. `^POST /wp-admin/admin-ajax\.php action=my_plugin_ping$`.
 
